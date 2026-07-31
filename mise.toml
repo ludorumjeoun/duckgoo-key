@@ -1,0 +1,48 @@
+min_version = "2026.7.13"
+
+[settings]
+lockfile = true
+
+[tools]
+rust = { version = "1.94.1", profile = "minimal", components = [
+  "rustfmt",
+  "clippy",
+], targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+] }
+"cargo:cargo-packager" = "0.11.8"
+python = "3.12.13"
+uv = "0.11.6"
+jq = "1.8.1"
+aws = "2.36.13"
+
+[tasks.dev]
+description = "Run DuckGooKey locally in debug mode"
+run = "cargo run --locked"
+
+[tasks.check]
+description = "Run formatting, tests, lints, and the release build"
+run = """
+set -eu
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
+"""
+
+[tasks.package]
+description = "Build the local macOS app and DMG"
+run = "./scripts/build-local.sh"
+
+[tasks.icons]
+description = "Rebuild the brand icon assets from a source image"
+run = '''
+#!/usr/bin/env bash
+set -eu
+if (( $# == 0 )); then
+  printf 'usage: mise run icons -- /path/to/source-image.png\n' >&2
+  exit 2
+fi
+uv run --with pillow==11.3.0 python scripts/build-brand-icons.py "$@"
+'''

@@ -8,9 +8,12 @@ GitHub Actions artifacts, and optionally publishes them to Cloudflare R2.
 
 - A release tag must be SemVer prefixed with `v`, such as `v0.1.0`.
 - The tag without `v` must exactly match `[package].version` in `Cargo.toml`.
+- `mise.toml` and `mise.lock` provide the exact Rust toolchain, macOS targets,
+  cargo-packager, Python, jq, and AWS CLI versions used by the workflow.
 - Both `aarch64-apple-darwin` and `x86_64-apple-darwin` are built with
   `cargo build --release --locked`.
-- `cargo-packager` 0.11.8 creates a `.app` and `.dmg` for each architecture.
+- The mise-managed cargo-packager creates a `.app` and `.dmg` for each
+  architecture.
 - The `.app` is preserved as a resource-safe `.app.zip` for download.
 - Every architecture artifact includes a `SHA256SUMS` file.
 - The release manifest advertises the DMG for each platform.
@@ -22,10 +25,9 @@ the release commit date for a lightweight tag. This keeps publication metadata
 deterministic across reruns; immutable uploads still reject any rebuilt
 artifact whose bytes differ from an object already stored for that version.
 
-The project currently has no application icon. The release configuration
-therefore omits `icons`; cargo-packager creates valid app and DMG bundles
-without a custom icon. Adding an icon later is a separate product change and
-is not required to ship.
+The release configuration packages `assets/icons/DuckGooKey.icns` into both
+the application and disk image. Rebuild the icon assets through the pinned
+toolchain with `mise run icons -- /path/to/source-image.png`.
 
 ## Starting a release
 

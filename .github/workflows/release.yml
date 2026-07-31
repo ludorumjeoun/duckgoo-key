@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CARGO_PACKAGER_VERSION: "0.11.8"
+  MISE_VERSION: "2026.7.13"
   MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
@@ -42,6 +42,12 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
           fetch-depth: 1
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: python
 
       - name: Validate tag and Cargo version
         id: release
@@ -131,23 +137,16 @@ jobs:
           ref: ${{ needs.prepare.outputs.tag }}
           fetch-depth: 1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.94.1
+      - name: Install pinned tools
+        uses: jdx/mise-action@v4
         with:
-          targets: ${{ matrix.target }}
+          version: ${{ env.MISE_VERSION }}
+          install_args: rust cargo:cargo-packager jq
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-
-      - name: Install cargo-packager
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo install cargo-packager \
-            --version "$CARGO_PACKAGER_VERSION" \
-            --locked
 
       - name: Build release binary
         shell: bash
@@ -240,13 +239,11 @@ jobs:
             )"
           fi
 
-          # No icons are configured intentionally. cargo-packager supports an
-          # icon-less .app and DMG, so the current lack of icon assets is not a
-          # release blocker.
           jq -n \
             --arg version "$VERSION" \
             --arg out_dir "$out_dir" \
             --arg binaries_dir "$binaries_dir" \
+            --arg icon "$GITHUB_WORKSPACE/assets/icons/DuckGooKey.icns" \
             --argjson macos "$macos_config" \
             '{
               name: "duckgoo-key",
@@ -259,6 +256,7 @@ jobs:
               binariesDir: $binaries_dir,
               binaries: [{path: "DuckGooKey", main: true}],
               formats: ["app", "dmg"],
+              icons: [$icon],
               macos: $macos
             }' > "$config_path"
 
@@ -381,6 +379,12 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.tag }}
           fetch-depth: 1
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: jq aws
 
       - name: Check R2 publishing configuration
         id: r2
