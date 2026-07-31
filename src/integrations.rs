@@ -1,5 +1,6 @@
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use image::ImageFormat;
 use tracing::warn;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -202,47 +203,25 @@ fn create_tray_icon(
         .with_tooltip("DuckGooKey")
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(true)
-        .with_icon(menu_bar_icon().map_err(|error| error.to_string())?)
-        .with_icon_as_template(cfg!(target_os = "macos"))
+        .with_icon(menu_bar_icon()?)
+        .with_icon_as_template(false)
         .build()
         .map_err(|error| error.to_string())?;
 
     Ok((tray_icon, launch_at_login))
 }
 
-fn menu_bar_icon() -> Result<Icon, tray_icon::BadIcon> {
-    const WIDTH: u32 = 22;
-    const HEIGHT: u32 = 22;
-    let mut rgba = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
+fn menu_bar_icon() -> Result<Icon, String> {
+    let image = image::load_from_memory_with_format(
+        include_bytes!("../assets/icons/duckgoo-key-128.png"),
+        ImageFormat::Png,
+    )
+    .map_err(|error| format!("could not decode the embedded brand icon: {error}"))?
+    .into_rgba8();
+    let (width, height) = image.dimensions();
 
-    let mut set_pixel = |x: u32, y: u32, alpha: u8| {
-        let index = ((y * WIDTH + x) * 4) as usize;
-        rgba[index..index + 4].copy_from_slice(&[0, 0, 0, alpha]);
-    };
-
-    for y in 3..14 {
-        for x in 2..13 {
-            let dx = x as i32 - 7;
-            let dy = y as i32 - 8;
-            let radius_squared = dx * dx + dy * dy;
-            if (8..=30).contains(&radius_squared) {
-                set_pixel(x, y, 255);
-            }
-        }
-    }
-
-    for y in 7..10 {
-        for x in 11..20 {
-            set_pixel(x, y, 255);
-        }
-    }
-    for y in 9..13 {
-        for x in 16..19 {
-            set_pixel(x, y, 255);
-        }
-    }
-
-    Icon::from_rgba(rgba, WIDTH, HEIGHT)
+    Icon::from_rgba(image.into_raw(), width, height)
+        .map_err(|error| format!("could not create the menu bar brand icon: {error}"))
 }
 
 #[cfg(test)]
