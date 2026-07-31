@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 directories = "6.0.0"
+fend-core = "=1.5.8"
 global-hotkey = "=0.8.0"
-iced = { version = "=0.14.0", features = ["tokio"] }
+iced = { version = "=0.14.0", features = ["image", "tokio"] }
+icns = "=0.4.0"
 plist = "1.8.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -21,10 +23,16 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = "=0.24.0"
+url = "=2.5.8"
 walkdir = "2.5"
 
 [dev-dependencies]
 tempfile = "3.20"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "=0.10.1"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString"] }
 
 [profile.release]
 codegen-units = 1
@@ -32,13 +40,14 @@ lto = "thin"
 strip = true
 
 [package.metadata.packager]
-before-packaging-command = "cargo build --release"
+before-packaging-command = "cargo build --release --locked"
 product-name = "DuckGooKey"
 identifier = "com.duckgoo.key"
 category = "Utility"
 out-dir = "target/release/packages"
 binaries = [{ path = "DuckGooKey", main = true }]
 formats = ["app", "dmg"]
+icons = ["assets/icons/DuckGooKey.icns"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "13.0"

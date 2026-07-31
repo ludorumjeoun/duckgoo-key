@@ -1,8 +1,10 @@
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tracing::warn;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+use crate::shortcut::ShortcutBinding;
 
 const SHOW_MENU_ID: &str = "duckgookey.show";
 const LAUNCH_AT_LOGIN_MENU_ID: &str = "duckgookey.launch-at-login";
@@ -18,7 +20,7 @@ pub enum IntegrationEvent {
 
 pub struct DesktopIntegrations {
     hotkey_manager: Option<GlobalHotKeyManager>,
-    launcher_hotkey: HotKey,
+    launcher_hotkey: Option<HotKey>,
     tray_icon: Option<TrayIcon>,
     show_menu_id: MenuId,
     launch_at_login_menu_id: MenuId,
@@ -28,25 +30,25 @@ pub struct DesktopIntegrations {
 }
 
 impl DesktopIntegrations {
-    pub fn initialize(launch_at_login: bool) -> Self {
-        let launcher_hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
+    pub fn initialize(launch_at_login: bool, shortcut: ShortcutBinding) -> Self {
+        let requested_hotkey = shortcut.to_hotkey();
         let mut warnings = Vec::new();
 
-        let hotkey_manager = match GlobalHotKeyManager::new() {
-            Ok(manager) => match manager.register(launcher_hotkey) {
-                Ok(()) => Some(manager),
+        let (hotkey_manager, launcher_hotkey) = match GlobalHotKeyManager::new() {
+            Ok(manager) => match manager.register(requested_hotkey) {
+                Ok(()) => (Some(manager), Some(requested_hotkey)),
                 Err(error) => {
-                    let message = format!("Could not register the Option+Space shortcut: {error}");
+                    let message = format!("Could not register the {shortcut} shortcut: {error}");
                     warn!("{message}");
                     warnings.push(message);
-                    None
+                    (Some(manager), None)
                 }
             },
             Err(error) => {
                 let message = format!("Could not initialize global shortcuts: {error}");
                 warn!("{message}");
                 warnings.push(message);
-                None
+                (None, None)
             }
         };
 
@@ -84,13 +86,58 @@ impl DesktopIntegrations {
         &self.warnings
     }
 
+    pub fn is_shortcut_active(&self, shortcut: ShortcutBinding) -> bool {
+        self.launcher_hotkey == Some(shortcut.to_hotkey())
+    }
+
+    /// Replaces the active shortcut while preserving the previous registration
+    /// whenever the operating system rejects the requested combination.
+    pub fn change_shortcut(&mut self, shortcut: ShortcutBinding) -> Result<(), String> {
+        let Some(manager) = self.hotkey_manager.as_ref() else {
+            return Err("global shortcut manager is unavailable".to_owned());
+        };
+        let requested = shortcut.to_hotkey();
+        if self.launcher_hotkey == Some(requested) {
+            return Ok(());
+        }
+
+        let previous = self.launcher_hotkey;
+        if let Some(previous) = previous {
+            manager
+                .unregister(previous)
+                .map_err(|error| format!("could not release the previous shortcut: {error}"))?;
+        }
+
+        match manager.register(requested) {
+            Ok(()) => {
+                self.launcher_hotkey = Some(requested);
+                Ok(())
+            }
+            Err(error) => {
+                self.launcher_hotkey = None;
+                if let Some(previous) = previous {
+                    match manager.register(previous) {
+                        Ok(()) => {
+                            self.launcher_hotkey = Some(previous);
+                            Err(format!("{error}; the previous shortcut was restored"))
+                        }
+                        Err(rollback_error) => Err(format!(
+                            "{error}; the previous shortcut could not be restored: {rollback_error}"
+                        )),
+                    }
+                } else {
+                    Err(error.to_string())
+                }
+            }
+        }
+    }
+
     pub fn drain_events(&self) -> Vec<IntegrationEvent> {
         let mut events = Vec::new();
 
-        if self.hotkey_manager.is_some() {
+        if let Some(launcher_hotkey) = self.launcher_hotkey {
             while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-                if event.id() == self.launcher_hotkey.id() && event.state() == HotKeyState::Pressed
-                {
+                if event.id() == launcher_hotkey.id() && event.state() == HotKeyState::Pressed {
                     events.push(IntegrationEvent::ToggleLauncher);
                 }
             }
@@ -209,8 +256,7 @@ mod tests {
 
     #[test]
     fn launcher_hotkey_is_option_space() {
-        let hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
-        assert_eq!(hotkey.mods, Modifiers::ALT);
-        assert_eq!(hotkey.key, Code::Space);
+        let hotkey = ShortcutBinding::default().to_hotkey();
+        assert_eq!(hotkey, ShortcutBinding::DEFAULT.to_hotkey());
     }
 }

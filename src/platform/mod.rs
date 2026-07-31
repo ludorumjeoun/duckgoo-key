@@ -9,11 +9,40 @@ mod fallback;
 mod macos;
 
 #[cfg(not(target_os = "macos"))]
-pub use fallback::{discover_applications, launch, launch_at_login_enabled, set_launch_at_login};
+pub use fallback::{
+    available_input_sources, clipboard_change_count, copy_text, current_input_source_identifier,
+    discover_applications, execute_system_command, launch, launch_at_login_enabled,
+    read_clipboard_text_if_changed, reveal_in_file_manager, search_files, select_input_source,
+    set_launch_at_login,
+};
 #[cfg(target_os = "macos")]
-pub use macos::{discover_applications, launch, launch_at_login_enabled, set_launch_at_login};
+pub use macos::{
+    available_input_sources, clipboard_change_count, copy_text, current_input_source_identifier,
+    discover_applications, execute_system_command, launch, launch_at_login_enabled,
+    read_clipboard_text_if_changed, reveal_in_file_manager, search_files, select_input_source,
+    set_launch_at_login,
+};
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputSource {
+    pub identifier: String,
+    pub localized_name: String,
+}
+
+/// A point-in-time view of the general clipboard.
+///
+/// `text` is `None` when the clipboard has not changed since the caller's
+/// previous change count, or when the new clipboard value is not plain text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardSnapshot {
+    /// A stable checkpoint the caller can supply on its next poll. If the
+    /// clipboard changes during a read, this remains the caller's previous
+    /// checkpoint so the new value is retried instead of being skipped.
+    pub change_count: i64,
+    pub text: Option<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
@@ -37,11 +66,32 @@ pub enum PlatformError {
         executable: &'static str,
         status: Option<i32>,
     },
-    #[error("{action} is an application action and cannot be launched by the platform")]
+    #[error("{executable} did not finish within {timeout_ms} ms")]
+    CommandTimedOut {
+        executable: &'static str,
+        timeout_ms: u64,
+    },
+    #[error("{action} must be handled by the launcher instead of the generic platform launch path")]
     UnsupportedAction { action: &'static str },
     #[error("{operation} is not supported on {platform}")]
     UnsupportedPlatform {
         operation: &'static str,
         platform: &'static str,
     },
+    #[error("macOS did not return the enabled keyboard input-source list")]
+    InputSourceListUnavailable,
+    #[error("macOS did not return the current keyboard input source")]
+    CurrentInputSourceUnavailable,
+    #[error("input source property `{property}` is missing")]
+    InputSourcePropertyMissing { property: &'static str },
+    #[error("input source property `{property}` has an unexpected Core Foundation type")]
+    InputSourcePropertyTypeMismatch { property: &'static str },
+    #[error("input source property `{property}` is empty")]
+    InputSourcePropertyEmpty { property: &'static str },
+    #[error("input source `{identifier}` is not enabled and selectable")]
+    InputSourceUnavailable { identifier: String },
+    #[error("macOS could not select input source `{identifier}` (OSStatus {status})")]
+    InputSourceSelectionFailed { identifier: String, status: i32 },
+    #[error("the clipboard rejected the {operation} operation")]
+    ClipboardOperationRejected { operation: &'static str },
 }

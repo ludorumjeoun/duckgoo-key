@@ -9,10 +9,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalog::UsageRecord;
+use crate::clipboard_history::ClipboardHistory;
+use crate::quick_link::QuickLink;
+use crate::shortcut::ShortcutBinding;
 
-pub const STORE_SCHEMA_VERSION: u32 = 1;
+pub const STORE_SCHEMA_VERSION: u32 = 2;
 const STORE_FILE_NAME: &str = "state.json";
 static UNIQUE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSettings {
+    #[serde(default)]
+    pub shortcut: ShortcutBinding,
+    /// Input-source identifier selected when the launcher search field gains focus.
+    #[serde(default)]
+    pub preferred_input_source: Option<String>,
+    /// Clipboard contents are recorded only after the user explicitly opts in.
+    #[serde(default)]
+    pub clipboard_history_enabled: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreData {
@@ -20,6 +35,16 @@ pub struct StoreData {
     pub schema_version: u32,
     #[serde(default)]
     pub usage: Vec<UsageRecord>,
+    #[serde(default)]
+    pub settings: AppSettings,
+    #[serde(default)]
+    pub quick_links: Vec<QuickLink>,
+    #[serde(default = "default_next_quick_link_id")]
+    pub next_quick_link_id: u64,
+    #[serde(default)]
+    pub clipboard_history: ClipboardHistory,
+    #[serde(default = "default_next_clipboard_entry_id")]
+    pub next_clipboard_entry_id: u64,
 }
 
 impl Default for StoreData {
@@ -27,6 +52,11 @@ impl Default for StoreData {
         Self {
             schema_version: STORE_SCHEMA_VERSION,
             usage: Vec::new(),
+            settings: AppSettings::default(),
+            quick_links: Vec::new(),
+            next_quick_link_id: default_next_quick_link_id(),
+            clipboard_history: ClipboardHistory::default(),
+            next_clipboard_entry_id: default_next_clipboard_entry_id(),
         }
     }
 }
@@ -70,16 +100,60 @@ impl StoreData {
         }
     }
 
+    pub fn allocate_quick_link_id(&mut self) -> u64 {
+        let id = self.next_quick_link_id.max(1);
+        self.next_quick_link_id = id.saturating_add(1);
+        id
+    }
+
+    pub fn allocate_clipboard_entry_id(&mut self) -> u64 {
+        let id = self.next_clipboard_entry_id.max(1);
+        self.next_clipboard_entry_id = id.saturating_add(1);
+        id
+    }
+
     fn normalize(&mut self) {
         let records = std::mem::take(&mut self.usage);
         for record in records {
             self.upsert_usage(record);
         }
+
+        let mut seen_quick_links = std::collections::HashSet::new();
+        self.quick_links
+            .retain(|quick_link| seen_quick_links.insert(quick_link.id()));
+        let next_after_existing = self
+            .quick_links
+            .iter()
+            .map(QuickLink::id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_quick_link_id = self.next_quick_link_id.max(next_after_existing).max(1);
+        let next_after_clipboard_history = self
+            .clipboard_history
+            .entries()
+            .iter()
+            .map(crate::clipboard_history::ClipboardEntry::id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.next_clipboard_entry_id = self
+            .next_clipboard_entry_id
+            .max(next_after_clipboard_history)
+            .max(1);
     }
 }
 
 fn current_schema_version() -> u32 {
     STORE_SCHEMA_VERSION
+}
+
+const fn default_next_quick_link_id() -> u64 {
+    1
+}
+
+const fn default_next_clipboard_entry_id() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,11 +232,15 @@ impl Store {
             }
         };
 
-        if data.schema_version != STORE_SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema {
-                found: data.schema_version,
-                expected: STORE_SCHEMA_VERSION,
-            });
+        match data.schema_version {
+            1 => data.schema_version = STORE_SCHEMA_VERSION,
+            STORE_SCHEMA_VERSION => {}
+            found => {
+                return Err(StoreError::UnsupportedSchema {
+                    found,
+                    expected: STORE_SCHEMA_VERSION,
+                });
+            }
         }
         data.normalize();
 
@@ -209,7 +287,12 @@ impl Store {
     }
 
     pub fn save_usage(&self, usage: &[UsageRecord]) -> Result<(), StoreError> {
-        self.save(&StoreData::from_usage(usage.iter().cloned()))
+        let mut data = self.load()?.data;
+        data.usage.clear();
+        for record in usage.iter().cloned() {
+            data.upsert_usage(record);
+        }
+        self.save(&data)
     }
 
     fn quarantine_corrupt_file(&self) -> Result<PathBuf, StoreError> {
@@ -240,7 +323,14 @@ impl Store {
 fn create_unique_file(target: &Path, purpose: &str) -> Result<(File, PathBuf), StoreError> {
     for _ in 0..128 {
         let path = unique_sibling_path(target, purpose)?;
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(StoreError::Io { path, source }),
@@ -375,6 +465,28 @@ mod tests {
     }
 
     #[test]
+    fn saving_usage_preserves_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        let mut data = StoreData::default();
+        data.settings.shortcut = ShortcutBinding::new(
+            crate::shortcut::ShortcutModifiers::COMMAND,
+            crate::shortcut::ShortcutKey::K,
+        )
+        .unwrap();
+        data.settings.preferred_input_source = Some("com.apple.keylayout.ABC".to_owned());
+        store.save(&data).unwrap();
+
+        store
+            .save_usage(&[UsageRecord::new("application:test")])
+            .unwrap();
+
+        let loaded = store.load().unwrap().data;
+        assert_eq!(loaded.settings, data.settings);
+        assert_eq!(loaded.usage[0].item_id, "application:test");
+    }
+
+    #[test]
     fn malformed_json_is_preserved_and_recovered_safely() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("state.json"));
@@ -420,5 +532,154 @@ mod tests {
         assert_eq!(data.usage.len(), 1);
         assert_eq!(data.usage[0].launch_count, 2);
         assert!(data.usage[0].pinned);
+    }
+
+    #[test]
+    fn legacy_store_without_settings_uses_the_default_shortcut() {
+        let data: StoreData = serde_json::from_str(r#"{"schema_version":1,"usage":[]}"#).unwrap();
+
+        assert_eq!(data.settings, AppSettings::default());
+        assert_eq!(data.settings.shortcut, ShortcutBinding::default());
+        assert_eq!(data.settings.preferred_input_source, None);
+    }
+
+    #[test]
+    fn legacy_settings_without_preferred_input_source_remain_compatible() {
+        let data: StoreData = serde_json::from_str(
+            r#"{"schema_version":1,"usage":[],"settings":{"shortcut":{"modifiers":{"command":false,"option":true,"control":false,"shift":false},"key":"space"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(data.settings.shortcut, ShortcutBinding::default());
+        assert_eq!(data.settings.preferred_input_source, None);
+    }
+
+    #[test]
+    fn preferred_input_source_round_trips_without_a_schema_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        let mut data = StoreData::default();
+        data.settings.preferred_input_source = Some("com.apple.keylayout.ABC".to_owned());
+
+        store.save(&data).unwrap();
+        let loaded = store.load().unwrap().data;
+
+        assert_eq!(loaded.schema_version, STORE_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.settings.preferred_input_source.as_deref(),
+            Some("com.apple.keylayout.ABC")
+        );
+    }
+
+    #[test]
+    fn schema_v1_loads_as_v2_with_new_feature_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        fs::write(
+            store.path(),
+            r#"{
+                "schema_version": 1,
+                "usage": [{
+                    "item_id": "application:test",
+                    "launch_count": 3,
+                    "last_launched_at_ms": 42,
+                    "pinned": true
+                }],
+                "settings": {
+                    "preferred_input_source": "com.apple.keylayout.ABC"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = store.load().unwrap();
+        let data = outcome.data;
+
+        assert_eq!(outcome.recovered_corrupt_file, None);
+        assert_eq!(data.schema_version, STORE_SCHEMA_VERSION);
+        assert_eq!(data.usage.len(), 1);
+        assert_eq!(data.usage[0].item_id, "application:test");
+        assert_eq!(data.usage[0].launch_count, 3);
+        assert!(data.usage[0].pinned);
+        assert_eq!(data.settings.shortcut, ShortcutBinding::default());
+        assert_eq!(
+            data.settings.preferred_input_source.as_deref(),
+            Some("com.apple.keylayout.ABC")
+        );
+        assert!(!data.settings.clipboard_history_enabled);
+        assert!(data.quick_links.is_empty());
+        assert_eq!(data.next_quick_link_id, 1);
+        assert!(data.clipboard_history.is_empty());
+        assert_eq!(data.next_clipboard_entry_id, 1);
+    }
+
+    #[test]
+    fn quick_links_and_clipboard_round_trip_with_normalized_identifiers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        let mut data = StoreData::default();
+        data.settings.clipboard_history_enabled = true;
+        data.quick_links = vec![
+            QuickLink::new(7, "Rust", "HTTPS://WWW.RUST-LANG.ORG/learn").unwrap(),
+            QuickLink::new(7, "Duplicate ID", "https://example.com/duplicate").unwrap(),
+            QuickLink::new(41, "DuckDuckGo", "https://duckduckgo.com").unwrap(),
+        ];
+        data.next_quick_link_id = 2;
+        data.clipboard_history
+            .capture(9, 100, "older clipboard value")
+            .unwrap();
+        data.clipboard_history
+            .capture(15, 200, "newer clipboard value")
+            .unwrap();
+        data.next_clipboard_entry_id = 3;
+
+        store.save(&data).unwrap();
+        let mut restored = store.load().unwrap().data;
+
+        assert!(restored.settings.clipboard_history_enabled);
+        assert_eq!(restored.quick_links.len(), 2);
+        assert_eq!(restored.quick_links[0].id(), 7);
+        assert_eq!(restored.quick_links[0].title(), "Rust");
+        assert_eq!(
+            restored.quick_links[0].url(),
+            "https://www.rust-lang.org/learn"
+        );
+        assert_eq!(restored.quick_links[1].id(), 41);
+        assert_eq!(restored.next_quick_link_id, 42);
+        assert_eq!(
+            restored
+                .clipboard_history
+                .entries()
+                .iter()
+                .map(crate::clipboard_history::ClipboardEntry::id)
+                .collect::<Vec<_>>(),
+            vec![15, 9]
+        );
+        assert_eq!(restored.next_clipboard_entry_id, 16);
+        assert_eq!(restored.allocate_quick_link_id(), 42);
+        assert_eq!(restored.allocate_clipboard_entry_id(), 16);
+        assert_eq!(restored.next_quick_link_id, 43);
+        assert_eq!(restored.next_clipboard_entry_id, 17);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_file_is_created_and_replaced_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        store.save(&StoreData::default()).unwrap();
+
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+        let mut replacement = StoreData::default();
+        replacement.settings.clipboard_history_enabled = true;
+        store.save(&replacement).unwrap();
+
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

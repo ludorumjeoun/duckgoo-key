@@ -1,8 +1,18 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::commands::SystemCommand;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    Files,
+    Clipboard,
+}
 
 /// An action that can be performed when a catalog item is selected.
 ///
@@ -14,6 +24,11 @@ use serde::{Deserialize, Serialize};
 pub enum LaunchAction {
     OpenApplication { path: PathBuf },
     OpenPath { path: PathBuf },
+    OpenUrl { url: String },
+    CopyText { text: String },
+    SystemCommand { command: SystemCommand },
+    EnterSearchMode { mode: SearchMode },
+    ManageQuickLinks,
     RefreshCatalog,
     Quit,
 }
@@ -22,7 +37,28 @@ impl LaunchAction {
     pub fn target(&self) -> Option<&Path> {
         match self {
             Self::OpenApplication { path } | Self::OpenPath { path } => Some(path),
-            Self::RefreshCatalog | Self::Quit => None,
+            Self::OpenUrl { .. }
+            | Self::CopyText { .. }
+            | Self::SystemCommand { .. }
+            | Self::EnterSearchMode { .. }
+            | Self::ManageQuickLinks
+            | Self::RefreshCatalog
+            | Self::Quit => None,
+        }
+    }
+
+    pub fn copy_payload(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::OpenApplication { path } | Self::OpenPath { path } => {
+                Some(path.to_string_lossy())
+            }
+            Self::OpenUrl { url } => Some(Cow::Borrowed(url)),
+            Self::CopyText { text } => Some(Cow::Borrowed(text)),
+            Self::SystemCommand { .. }
+            | Self::EnterSearchMode { .. }
+            | Self::ManageQuickLinks
+            | Self::RefreshCatalog
+            | Self::Quit => None,
         }
     }
 }
@@ -34,9 +70,18 @@ pub struct CatalogItem {
     pub id: String,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Optional platform-provided artwork for the item.
+    #[serde(default)]
+    pub icon_path: Option<PathBuf>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    #[serde(default = "default_pinnable")]
+    pub pinnable: bool,
     pub action: LaunchAction,
+}
+
+const fn default_pinnable() -> bool {
+    true
 }
 
 impl CatalogItem {
@@ -56,7 +101,9 @@ impl CatalogItem {
             id,
             title,
             subtitle,
+            icon_path: None,
             keywords,
+            pinnable: true,
             action: LaunchAction::OpenApplication { path },
         }
     }
@@ -67,8 +114,50 @@ impl CatalogItem {
             id: format!("path:{}", path.to_string_lossy()),
             title: title.into(),
             subtitle: Some(path.to_string_lossy().into_owned()),
+            icon_path: None,
             keywords: Vec::new(),
+            pinnable: true,
             action: LaunchAction::OpenPath { path },
+        }
+    }
+
+    pub fn search_files() -> Self {
+        Self {
+            id: "builtin:search-files".to_owned(),
+            title: "Search Files".to_owned(),
+            subtitle: Some("Find files and folders with Spotlight".to_owned()),
+            icon_path: None,
+            keywords: vec!["finder".to_owned(), "spotlight".to_owned()],
+            pinnable: true,
+            action: LaunchAction::EnterSearchMode {
+                mode: SearchMode::Files,
+            },
+        }
+    }
+
+    pub fn clipboard_history() -> Self {
+        Self {
+            id: "builtin:clipboard-history".to_owned(),
+            title: "Clipboard History".to_owned(),
+            subtitle: Some("Find previously copied text".to_owned()),
+            icon_path: None,
+            keywords: vec!["copy".to_owned(), "paste".to_owned()],
+            pinnable: true,
+            action: LaunchAction::EnterSearchMode {
+                mode: SearchMode::Clipboard,
+            },
+        }
+    }
+
+    pub fn manage_quick_links() -> Self {
+        Self {
+            id: "builtin:manage-quick-links".to_owned(),
+            title: "Manage Quick Links".to_owned(),
+            subtitle: Some("Add, edit, or remove saved websites".to_owned()),
+            icon_path: None,
+            keywords: vec!["bookmark".to_owned(), "url".to_owned()],
+            pinnable: true,
+            action: LaunchAction::ManageQuickLinks,
         }
     }
 
@@ -77,7 +166,9 @@ impl CatalogItem {
             id: "builtin:refresh-catalog".to_owned(),
             title: "Refresh Applications".to_owned(),
             subtitle: Some("Rescan installed applications".to_owned()),
+            icon_path: None,
             keywords: vec!["reload".to_owned(), "rescan".to_owned()],
+            pinnable: true,
             action: LaunchAction::RefreshCatalog,
         }
     }
@@ -87,13 +178,21 @@ impl CatalogItem {
             id: "builtin:quit".to_owned(),
             title: "Quit DuckGooKey".to_owned(),
             subtitle: Some("Close the launcher".to_owned()),
+            icon_path: None,
             keywords: vec!["exit".to_owned()],
+            pinnable: true,
             action: LaunchAction::Quit,
         }
     }
 
-    pub fn built_in_items() -> [Self; 2] {
-        [Self::refresh_catalog(), Self::quit()]
+    pub fn built_in_items() -> Vec<Self> {
+        vec![
+            Self::search_files(),
+            Self::clipboard_history(),
+            Self::manage_quick_links(),
+            Self::refresh_catalog(),
+            Self::quit(),
+        ]
     }
 }
 
@@ -446,7 +545,9 @@ mod tests {
             id: id.to_owned(),
             title: title.to_owned(),
             subtitle: None,
+            icon_path: None,
             keywords: Vec::new(),
+            pinnable: true,
             action: LaunchAction::OpenPath {
                 path: PathBuf::from(format!("/{id}")),
             },
@@ -562,5 +663,23 @@ mod tests {
         catalog.upsert(item("same", "Replacement"));
         assert_eq!(catalog.items().len(), 1);
         assert_eq!(catalog.items()[0].title, "Replacement");
+    }
+
+    #[test]
+    fn older_serialized_items_default_to_no_icon() {
+        let serialized = r#"{
+            "id": "application:/Applications/Example.app",
+            "title": "Example",
+            "subtitle": "/Applications/Example.app",
+            "keywords": [],
+            "action": {
+                "type": "open_application",
+                "path": "/Applications/Example.app"
+            }
+        }"#;
+
+        let item: CatalogItem = serde_json::from_str(serialized).unwrap();
+
+        assert_eq!(item.icon_path, None);
     }
 }
