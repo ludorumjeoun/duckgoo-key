@@ -1,0 +1,6 @@
+/target/
+/.DS_Store
+/.idea/
+/.vscode/
+*.log
+release-manifest.json

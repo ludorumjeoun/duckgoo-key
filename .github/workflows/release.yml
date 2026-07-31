@@ -1,0 +1,473 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build (for example, v0.1.0)"
+        required: true
+        type: string
+      publish_r2:
+        description: "Publish immutable assets and latest.json to Cloudflare R2"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_PACKAGER_VERSION: "0.11.8"
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      pub_date: ${{ steps.release.outputs.pub_date }}
+      publish_requested: ${{ steps.release.outputs.publish_requested }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          fetch-depth: 1
+
+      - name: Validate tag and Cargo version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.release_tag }}
+          PUBLISH_REQUESTED: ${{ github.event_name == 'push' || inputs.publish_r2 }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$MANUAL_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag must be a SemVer tag beginning with v (for example, v0.1.0)."
+            exit 1
+          fi
+
+          version="$(
+            python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(cargo["package"]["version"])
+          PY
+          )"
+
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::error::Tag $tag does not match Cargo.toml package version $version."
+            exit 1
+          fi
+
+          tag_date="$(git for-each-ref --format='%(taggerdate:iso-strict)' "refs/tags/$tag")"
+          if [[ -n "$tag_date" ]]; then
+            release_date="$tag_date"
+          else
+            # Lightweight tags have no tagger date, so use the immutable
+            # release commit timestamp instead.
+            release_date="$(git show -s --format=%cI HEAD)"
+          fi
+          pub_date="$(date -u --date="$release_date" +"%Y-%m-%dT%H:%M:%SZ")"
+          publish_requested="${PUBLISH_REQUESTED,,}"
+          if [[ "$publish_requested" != "true" ]]; then
+            publish_requested="false"
+          fi
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'tag=%s\n' "$tag"
+            printf 'pub_date=%s\n' "$pub_date"
+            printf 'publish_requested=%s\n' "$publish_requested"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### DuckGooKey release"
+            echo
+            echo "- Tag: \`$tag\`"
+            echo "- Version: \`$version\`"
+            echo "- Publication date: \`$pub_date\`"
+            echo "- R2 requested: \`$publish_requested\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            target: aarch64-apple-darwin
+            expected_arch: arm64
+          - platform: macos-x86_64
+            target: x86_64-apple-darwin
+            expected_arch: x86_64
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cargo-packager
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-packager \
+            --version "$CARGO_PACKAGER_VERSION" \
+            --locked
+
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Configure package and optional Apple signing
+        id: packager-config
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          require_command() {
+            if ! command -v "$1" >/dev/null 2>&1; then
+              echo "::error::Required command is unavailable: $1"
+              exit 1
+            fi
+          }
+          require_command jq
+
+          signing_count=0
+          for value in "$APPLE_CERTIFICATE" "$APPLE_CERTIFICATE_PASSWORD" "$APPLE_SIGNING_IDENTITY"; do
+            if [[ -n "$value" ]]; then
+              signing_count=$((signing_count + 1))
+            fi
+          done
+
+          signing_enabled="false"
+          if (( signing_count == 3 )); then
+            signing_enabled="true"
+          elif (( signing_count > 0 )); then
+            echo "::warning::Apple signing configuration is incomplete; this build will remain unsigned."
+          else
+            echo "::notice::Apple signing secrets are not configured; building unsigned artifacts."
+          fi
+
+          notarization_count=0
+          for value in "$APPLE_ID" "$APPLE_PASSWORD" "$APPLE_TEAM_ID"; do
+            if [[ -n "$value" ]]; then
+              notarization_count=$((notarization_count + 1))
+            fi
+          done
+
+          notarization_enabled="false"
+          if [[ "$signing_enabled" == "true" ]] && (( notarization_count == 3 )); then
+            notarization_enabled="true"
+          elif (( notarization_count > 0 && notarization_count < 3 )); then
+            echo "::warning::Apple notarization configuration is incomplete; notarization will be skipped."
+          elif [[ "$signing_enabled" == "true" ]]; then
+            echo "::notice::Apple notarization secrets are not configured; producing a signed, non-notarized build."
+          fi
+
+          out_dir="$RUNNER_TEMP/duckgookey-packages/$PLATFORM"
+          binaries_dir="$GITHUB_WORKSPACE/target/$TARGET/release"
+          config_path="$RUNNER_TEMP/duckgookey-packager-$PLATFORM.json"
+          mkdir -p "$out_dir"
+
+          if [[ "$signing_enabled" == "true" ]]; then
+            macos_config="$(
+              jq -n \
+                --arg minimum_system_version "$MACOSX_DEPLOYMENT_TARGET" \
+                --arg signing_identity "$APPLE_SIGNING_IDENTITY" \
+                '{
+                  minimumSystemVersion: $minimum_system_version,
+                  backgroundApp: true,
+                  signingIdentity: $signing_identity
+                }'
+            )"
+          else
+            macos_config="$(
+              jq -n \
+                --arg minimum_system_version "$MACOSX_DEPLOYMENT_TARGET" \
+                '{
+                  minimumSystemVersion: $minimum_system_version,
+                  backgroundApp: true
+                }'
+            )"
+          fi
+
+          # No icons are configured intentionally. cargo-packager supports an
+          # icon-less .app and DMG, so the current lack of icon assets is not a
+          # release blocker.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg out_dir "$out_dir" \
+            --arg binaries_dir "$binaries_dir" \
+            --argjson macos "$macos_config" \
+            '{
+              name: "duckgoo-key",
+              productName: "DuckGooKey",
+              identifier: "com.duckgoo.key",
+              version: $version,
+              description: "A fast, keyboard-first desktop launcher written in Rust",
+              category: "Utility",
+              outDir: $out_dir,
+              binariesDir: $binaries_dir,
+              binaries: [{path: "DuckGooKey", main: true}],
+              formats: ["app", "dmg"],
+              macos: $macos
+            }' > "$config_path"
+
+          {
+            printf 'config=%s\n' "$config_path"
+            printf 'out_dir=%s\n' "$out_dir"
+            printf 'signing_enabled=%s\n' "$signing_enabled"
+            printf 'notarization_enabled=%s\n' "$notarization_enabled"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Package app and DMG
+        shell: bash
+        env:
+          PACKAGER_CONFIG: ${{ steps.packager-config.outputs.config }}
+          TARGET: ${{ matrix.target }}
+          SIGNING_ENABLED: ${{ steps.packager-config.outputs.signing_enabled }}
+          NOTARIZATION_ENABLED: ${{ steps.packager-config.outputs.notarization_enabled }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # GitHub exposes an unset secret as an empty environment variable.
+          # cargo-packager checks variable presence, so remove disabled groups
+          # entirely to keep signing and notarization genuinely optional.
+          if [[ "$SIGNING_ENABLED" != "true" ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          fi
+          if [[ "$NOTARIZATION_ENABLED" != "true" ]]; then
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+
+          cargo packager \
+            --config "$PACKAGER_CONFIG" \
+            --target "$TARGET" \
+            --formats app,dmg
+
+      - name: Verify and stage release assets
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+          PACKAGE_DIR: ${{ steps.packager-config.outputs.out_dir }}
+          SIGNING_ENABLED: ${{ steps.packager-config.outputs.signing_enabled }}
+          NOTARIZATION_ENABLED: ${{ steps.packager-config.outputs.notarization_enabled }}
+        run: |
+          set -euo pipefail
+
+          app_path="$PACKAGE_DIR/DuckGooKey.app"
+          executable_path="$app_path/Contents/MacOS/DuckGooKey"
+          if [[ ! -x "$executable_path" ]]; then
+            echo "::error::Packaged executable is missing: $executable_path"
+            exit 1
+          fi
+
+          actual_arch="$(lipo -archs "$executable_path")"
+          if [[ "$actual_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "::error::Expected $EXPECTED_ARCH, but packaged executable contains: $actual_arch"
+            exit 1
+          fi
+
+          if [[ "$SIGNING_ENABLED" == "true" ]]; then
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+          fi
+          if [[ "$NOTARIZATION_ENABLED" == "true" ]]; then
+            xcrun stapler validate "$app_path"
+          fi
+
+          shopt -s nullglob
+          dmg_candidates=("$PACKAGE_DIR"/*.dmg)
+          if (( ${#dmg_candidates[@]} != 1 )); then
+            echo "::error::Expected exactly one DMG in $PACKAGE_DIR; found ${#dmg_candidates[@]}."
+            exit 1
+          fi
+          if [[ "$SIGNING_ENABLED" == "true" ]]; then
+            codesign --verify --strict --verbose=2 "${dmg_candidates[0]}"
+          fi
+
+          release_dir="$RUNNER_TEMP/duckgookey-release/$PLATFORM"
+          mkdir -p "$release_dir"
+
+          dmg_name="DuckGooKey-$VERSION-$PLATFORM.dmg"
+          app_zip_name="DuckGooKey-$VERSION-$PLATFORM.app.zip"
+          checksums_name="DuckGooKey-$VERSION-$PLATFORM.SHA256SUMS"
+
+          mv "${dmg_candidates[0]}" "$release_dir/$dmg_name"
+          ditto -c -k --keepParent --sequesterRsrc \
+            "$app_path" \
+            "$release_dir/$app_zip_name"
+
+          (
+            cd "$release_dir"
+            shasum -a 256 "$dmg_name" "$app_zip_name" > "$checksums_name"
+          )
+
+          printf 'release_dir=%s\n' "$release_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload GitHub build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DuckGooKey-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}
+          path: ${{ steps.stage.outputs.release_dir }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-r2:
+    name: Publish to Cloudflare R2
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Check R2 publishing configuration
+        id: r2
+        shell: bash
+        env:
+          PUBLISH_REQUESTED: ${{ needs.prepare.outputs.publish_requested }}
+          R2_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+          R2_ENDPOINT: ${{ vars.CLOUDFLARE_R2_ENDPOINT }}
+          R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$PUBLISH_REQUESTED" != "true" ]]; then
+            echo "::notice::R2 publishing was disabled for this manual run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          missing=()
+          [[ -n "$R2_ACCESS_KEY_ID" ]] || missing+=("CLOUDFLARE_R2_ACCESS_KEY_ID secret")
+          [[ -n "$R2_SECRET_ACCESS_KEY" ]] || missing+=("CLOUDFLARE_R2_SECRET_ACCESS_KEY secret")
+          [[ -n "$R2_BUCKET" ]] || missing+=("CLOUDFLARE_R2_BUCKET variable")
+          [[ -n "$R2_ENDPOINT" ]] || missing+=("CLOUDFLARE_R2_ENDPOINT variable")
+          [[ -n "$R2_PUBLIC_BASE_URL" ]] || missing+=("CLOUDFLARE_R2_PUBLIC_BASE_URL variable")
+
+          if (( ${#missing[@]} > 0 )); then
+            printf -v missing_list '%s, ' "${missing[@]}"
+            echo "::warning::R2 publishing skipped; missing ${missing_list%, }."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download architecture artifacts
+        if: steps.r2.outputs.enabled == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: DuckGooKey-${{ needs.prepare.outputs.version }}-macos-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Build latest release manifest
+        if: steps.r2.outputs.enabled == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PUB_DATE: ${{ needs.prepare.outputs.pub_date }}
+          R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          ./scripts/build-release-manifest.sh \
+            --version "$VERSION" \
+            --pub-date "$PUB_DATE" \
+            --base-url "$R2_PUBLIC_BASE_URL" \
+            --artifacts-dir "$GITHUB_WORKSPACE/release-assets" \
+            --output "$GITHUB_WORKSPACE/release-assets/latest.json"
+
+      - name: Upload manifest artifact
+        if: steps.r2.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: DuckGooKey-${{ needs.prepare.outputs.version }}-release-manifest
+          path: release-assets/latest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish immutable assets, then latest.json
+        if: steps.r2.outputs.enabled == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          VERSION: ${{ needs.prepare.outputs.version }}
+          R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+          R2_ENDPOINT: ${{ vars.CLOUDFLARE_R2_ENDPOINT }}
+          R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          ./scripts/publish-r2.sh \
+            --version "$VERSION" \
+            --bucket "$R2_BUCKET" \
+            --endpoint "$R2_ENDPOINT" \
+            --base-url "$R2_PUBLIC_BASE_URL" \
+            --artifacts-dir "$GITHUB_WORKSPACE/release-assets" \
+            --manifest "$GITHUB_WORKSPACE/release-assets/latest.json"

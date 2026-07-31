@@ -1,0 +1,45 @@
+[package]
+name = "duckgoo-key"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "A fast, keyboard-first desktop launcher written in Rust"
+
+[[bin]]
+name = "DuckGooKey"
+path = "src/main.rs"
+
+[dependencies]
+directories = "6.0.0"
+global-hotkey = "=0.8.0"
+iced = { version = "=0.14.0", features = ["tokio"] }
+plist = "1.8.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tray-icon = "=0.24.0"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[package.metadata.packager]
+before-packaging-command = "cargo build --release"
+product-name = "DuckGooKey"
+identifier = "com.duckgoo.key"
+category = "Utility"
+out-dir = "target/release/packages"
+binaries = [{ path = "DuckGooKey", main = true }]
+formats = ["app", "dmg"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "13.0"
+background-app = true
