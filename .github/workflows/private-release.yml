@@ -1,0 +1,346 @@
+name: Private Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build with the private signing identity"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  MISE_VERSION: "2026.7.13"
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  prepare:
+    name: Prepare private release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 1
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: python
+
+      - name: Validate tag and Cargo version
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag must be a SemVer tag beginning with v (for example, v0.1.0)."
+            exit 1
+          fi
+
+          version="$(
+            python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(cargo["package"]["version"])
+          PY
+          )"
+
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "::error::Tag $RELEASE_TAG does not match Cargo.toml package version $version."
+            exit 1
+          fi
+
+          {
+            printf 'version=%s\n' "$version"
+            printf 'tag=%s\n' "$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build private ${{ matrix.platform }}
+    needs: prepare
+    runs-on: macos-15
+    environment: private-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            target: aarch64-apple-darwin
+            expected_arch: arm64
+          - platform: macos-x86_64
+            target: x86_64-apple-darwin
+            expected_arch: x86_64
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@v4
+        with:
+          version: ${{ env.MISE_VERSION }}
+          install_args: rust cargo:cargo-packager jq
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: private-release-${{ matrix.target }}
+
+      - name: Validate private signing configuration
+        id: private-config
+        shell: bash
+        env:
+          PRIVATE_SIGNING_CERTIFICATE: ${{ secrets.PRIVATE_SIGNING_CERTIFICATE }}
+          PRIVATE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.PRIVATE_SIGNING_CERTIFICATE_PASSWORD }}
+          PRIVATE_SIGNING_CERT_SHA256: ${{ vars.PRIVATE_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ -n "$PRIVATE_SIGNING_CERTIFICATE" ]] || missing+=("PRIVATE_SIGNING_CERTIFICATE secret")
+          [[ -n "$PRIVATE_SIGNING_CERTIFICATE_PASSWORD" ]] || missing+=("PRIVATE_SIGNING_CERTIFICATE_PASSWORD secret")
+          [[ -n "$PRIVATE_SIGNING_CERT_SHA256" ]] || missing+=("PRIVATE_SIGNING_CERT_SHA256 variable")
+          if (( ${#missing[@]} > 0 )); then
+            printf -v missing_list '%s, ' "${missing[@]}"
+            echo "::error::Private signing is missing ${missing_list%, }."
+            exit 1
+          fi
+
+          certificate_sha256="$(
+            printf '%s' "$PRIVATE_SIGNING_CERT_SHA256" |
+              tr -d '[:space:]:' |
+              tr '[:upper:]' '[:lower:]'
+          )"
+          if [[ ! "$certificate_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::PRIVATE_SIGNING_CERT_SHA256 must contain a 64-character SHA-256 fingerprint."
+            exit 1
+          fi
+
+          {
+            printf 'certificate_sha256=%s\n' "$certificate_sha256"
+            printf 'fingerprint_short=%s\n' "${certificate_sha256:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Configure unsigned package assembly
+        id: packager
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          out_dir="$RUNNER_TEMP/duckgookey-private-packages/$PLATFORM"
+          binaries_dir="$GITHUB_WORKSPACE/target/$TARGET/release"
+          config_path="$RUNNER_TEMP/duckgookey-private-packager-$PLATFORM.json"
+          mkdir -p "$out_dir"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg out_dir "$out_dir" \
+            --arg binaries_dir "$binaries_dir" \
+            --arg icon "$GITHUB_WORKSPACE/assets/icons/DuckGooKey.icns" \
+            --arg minimum_system_version "$MACOSX_DEPLOYMENT_TARGET" \
+            '{
+              name: "duckgoo-key",
+              productName: "DuckGooKey",
+              identifier: "com.duckgoo.key",
+              version: $version,
+              description: "A fast, keyboard-first desktop launcher written in Rust",
+              category: "Utility",
+              outDir: $out_dir,
+              binariesDir: $binaries_dir,
+              binaries: [{path: "DuckGooKey", main: true}],
+              formats: ["app", "dmg"],
+              icons: [$icon],
+              macos: {
+                minimumSystemVersion: $minimum_system_version,
+                backgroundApp: true
+              }
+            }' > "$config_path"
+
+          {
+            printf 'config=%s\n' "$config_path"
+            printf 'out_dir=%s\n' "$out_dir"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble app and DMG
+        shell: bash
+        env:
+          PACKAGER_CONFIG: ${{ steps.packager.outputs.config }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo packager \
+            --config "$PACKAGER_CONFIG" \
+            --target "$TARGET" \
+            --formats app,dmg
+
+      - name: Sign private app and DMG
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PACKAGE_DIR: ${{ steps.packager.outputs.out_dir }}
+          EXPECTED_CERT_SHA256: ${{ steps.private-config.outputs.certificate_sha256 }}
+          PRIVATE_SIGNING_CERTIFICATE: ${{ secrets.PRIVATE_SIGNING_CERTIFICATE }}
+          PRIVATE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.PRIVATE_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          encoded_path="$RUNNER_TEMP/duckgookey-private-$PLATFORM.p12.base64"
+          p12_path="$RUNNER_TEMP/duckgookey-private-$PLATFORM.p12"
+          cleanup() {
+            rm -f "$encoded_path" "$p12_path"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$PRIVATE_SIGNING_CERTIFICATE" > "$encoded_path"
+          base64 --decode -i "$encoded_path" -o "$p12_path"
+          chmod 600 "$p12_path"
+
+          shopt -s nullglob
+          dmg_candidates=("$PACKAGE_DIR"/*.dmg)
+          if (( ${#dmg_candidates[@]} != 1 )); then
+            echo "::error::Expected exactly one DMG in $PACKAGE_DIR; found ${#dmg_candidates[@]}."
+            exit 1
+          fi
+
+          DUCKGOOKEY_PRIVATE_SIGNING_PASSWORD="$PRIVATE_SIGNING_CERTIFICATE_PASSWORD" \
+            ./scripts/sign-macos-private.sh \
+              --app "$PACKAGE_DIR/DuckGooKey.app" \
+              --dmg "${dmg_candidates[0]}" \
+              --p12 "$p12_path" \
+              --expected-cert-sha256 "$EXPECTED_CERT_SHA256" \
+              --certificate-out "$PACKAGE_DIR/DuckGooKey-Private-Code-Signing.cer" \
+              --metadata-out "$PACKAGE_DIR/DuckGooKey-Private-SIGNING.txt"
+
+      - name: Verify and stage private assets
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+          EXPECTED_CERT_SHA256: ${{ steps.private-config.outputs.certificate_sha256 }}
+          PACKAGE_DIR: ${{ steps.packager.outputs.out_dir }}
+        run: |
+          set -euo pipefail
+
+          app_path="$PACKAGE_DIR/DuckGooKey.app"
+          executable_path="$app_path/Contents/MacOS/DuckGooKey"
+          certificate_path="$PACKAGE_DIR/DuckGooKey-Private-Code-Signing.cer"
+          metadata_path="$PACKAGE_DIR/DuckGooKey-Private-SIGNING.txt"
+          [[ -x "$executable_path" ]] || {
+            echo "::error::Packaged executable is missing: $executable_path"
+            exit 1
+          }
+          [[ -s "$certificate_path" ]] || {
+            echo "::error::Public signing certificate is missing."
+            exit 1
+          }
+          [[ -s "$metadata_path" ]] || {
+            echo "::error::Private signing metadata is missing."
+            exit 1
+          }
+
+          actual_arch="$(lipo -archs "$executable_path")"
+          if [[ "$actual_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "::error::Expected $EXPECTED_ARCH, but packaged executable contains: $actual_arch"
+            exit 1
+          fi
+
+          certificate_sha256="$(shasum -a 256 "$certificate_path" | awk '{print $1}')"
+          if [[ "$certificate_sha256" != "$EXPECTED_CERT_SHA256" ]]; then
+            echo "::error::Staged public certificate does not match the pinned fingerprint."
+            exit 1
+          fi
+
+          shopt -s nullglob
+          dmg_candidates=("$PACKAGE_DIR"/*.dmg)
+          if (( ${#dmg_candidates[@]} != 1 )); then
+            echo "::error::Expected exactly one signed DMG in $PACKAGE_DIR; found ${#dmg_candidates[@]}."
+            exit 1
+          fi
+          dmg_path="${dmg_candidates[0]}"
+          hdiutil verify "$dmg_path"
+
+          release_dir="$RUNNER_TEMP/duckgookey-private-release/$PLATFORM"
+          mkdir -p "$release_dir"
+          dmg_name="DuckGooKey-Private-$VERSION-$PLATFORM.dmg"
+          app_zip_name="DuckGooKey-Private-$VERSION-$PLATFORM.app.zip"
+          certificate_name="DuckGooKey-Private-$VERSION-Code-Signing.cer"
+          metadata_name="DuckGooKey-Private-$VERSION-$PLATFORM-SIGNING.txt"
+          checksums_name="DuckGooKey-Private-$VERSION-$PLATFORM.SHA256SUMS"
+
+          cp "$dmg_path" "$release_dir/$dmg_name"
+          ditto -c -k --keepParent --sequesterRsrc \
+            "$app_path" \
+            "$release_dir/$app_zip_name"
+          cp "$certificate_path" "$release_dir/$certificate_name"
+          cp "$metadata_path" "$release_dir/$metadata_name"
+
+          (
+            cd "$release_dir"
+            shasum -a 256 \
+              "$dmg_name" \
+              "$app_zip_name" \
+              "$certificate_name" \
+              "$metadata_name" > "$checksums_name"
+          )
+
+          unsafe_file="$(
+            find "$release_dir" -type f \
+              \( -name '*.p12' -o -name '*.pfx' -o -name '*.key' -o -name '*.key.pem' -o -name '*.keychain*' \) \
+              -print -quit
+          )"
+          if [[ -n "$unsafe_file" ]]; then
+            echo "::error::Private key material must never be uploaded: $unsafe_file"
+            exit 1
+          fi
+
+          printf 'release_dir=%s\n' "$release_dir" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### DuckGooKey private release"
+            echo
+            echo "- Platform: \`$PLATFORM\`"
+            echo "- Certificate SHA-256: \`$EXPECTED_CERT_SHA256\`"
+            echo "- Apple notarization: \`not used\`"
+            echo "- Distribution: private testers only"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload private build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DuckGooKey-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}-private-signed-${{ steps.private-config.outputs.fingerprint_short }}
+          path: ${{ steps.stage.outputs.release_dir }}
+          if-no-files-found: error
+          retention-days: 14

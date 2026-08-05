@@ -4,3 +4,11 @@
 /.vscode/
 *.log
 release-manifest.json
+
+# Signing private keys and temporary keychains must never enter the repository.
+*.key
+*.key.pem
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
