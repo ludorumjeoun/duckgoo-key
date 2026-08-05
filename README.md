@@ -159,6 +159,7 @@ The searchable command catalog includes:
 
 - **Open System Settings**
 - **Sleep**
+- **Lock Screen**
 - **Toggle System Appearance**
 - **Empty Trash**
 - **Log Out**

@@ -85,15 +85,23 @@ unsafe extern "C" {
 }
 
 pub fn discover_applications() -> Result<Vec<CatalogItem>> {
+    let home_directory = UserDirs::new().map(|directories| directories.home_dir().to_owned());
+    Ok(discover_in_roots(&application_roots(
+        home_directory.as_deref(),
+    )))
+}
+
+fn application_roots(home_directory: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = vec![
         PathBuf::from("/Applications"),
         PathBuf::from("/System/Applications"),
+        PathBuf::from("/System/Library/CoreServices/Applications"),
+        PathBuf::from("/System/Library/CoreServices/Finder.app"),
     ];
-    if let Some(user_directories) = UserDirs::new() {
-        roots.push(user_directories.home_dir().join("Applications"));
+    if let Some(home_directory) = home_directory {
+        roots.push(home_directory.join("Applications"));
     }
-
-    Ok(discover_in_roots(&roots))
+    roots
 }
 
 pub fn launch(action: &LaunchAction) -> Result<()> {
@@ -209,6 +217,14 @@ fn system_command_spec(command: &SystemCommand) -> SystemCommandSpec {
             executable: PMSET_EXECUTABLE,
             arguments: &["sleepnow"],
             operation: "putting the Mac to sleep",
+        },
+        SystemCommand::LockScreen => SystemCommandSpec {
+            executable: OSASCRIPT_EXECUTABLE,
+            arguments: &[
+                "-e",
+                "tell application \"System Events\" to keystroke \"q\" using {control down, command down}",
+            ],
+            operation: "locking the screen",
         },
         SystemCommand::ToggleAppearance => SystemCommandSpec {
             executable: OSASCRIPT_EXECUTABLE,
@@ -1057,6 +1073,15 @@ mod tests {
     }
 
     #[test]
+    fn application_roots_include_user_facing_core_services() {
+        let roots = application_roots(Some(Path::new("/Users/example")));
+
+        assert!(roots.contains(&PathBuf::from("/System/Library/CoreServices/Applications")));
+        assert!(roots.contains(&PathBuf::from("/System/Library/CoreServices/Finder.app")));
+        assert!(roots.contains(&PathBuf::from("/Users/example/Applications")));
+    }
+
+    #[test]
     fn discovery_resolves_bundle_icon_file_with_an_omitted_extension() {
         let directory = tempfile::tempdir().unwrap();
         let bundle = directory.path().join("Example.app");
@@ -1249,6 +1274,14 @@ mod tests {
                 &["-b", "com.apple.systempreferences"][..],
             ),
             (SystemCommand::Sleep, PMSET_EXECUTABLE, &["sleepnow"][..]),
+            (
+                SystemCommand::LockScreen,
+                OSASCRIPT_EXECUTABLE,
+                &[
+                    "-e",
+                    "tell application \"System Events\" to keystroke \"q\" using {control down, command down}",
+                ][..],
+            ),
             (
                 SystemCommand::ToggleAppearance,
                 OSASCRIPT_EXECUTABLE,

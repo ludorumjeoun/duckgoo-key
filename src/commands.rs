@@ -12,6 +12,7 @@ use crate::catalog::{CatalogItem, LaunchAction};
 pub enum SystemCommand {
     OpenSystemSettings,
     Sleep,
+    LockScreen,
     ToggleAppearance,
     EmptyTrash,
     LogOut,
@@ -20,9 +21,10 @@ pub enum SystemCommand {
 }
 
 impl SystemCommand {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::OpenSystemSettings,
         Self::Sleep,
+        Self::LockScreen,
         Self::ToggleAppearance,
         Self::EmptyTrash,
         Self::LogOut,
@@ -34,6 +36,7 @@ impl SystemCommand {
         match self {
             Self::OpenSystemSettings => "open-system-settings",
             Self::Sleep => "sleep",
+            Self::LockScreen => "lock-screen",
             Self::ToggleAppearance => "toggle-appearance",
             Self::EmptyTrash => "empty-trash",
             Self::LogOut => "log-out",
@@ -46,6 +49,7 @@ impl SystemCommand {
         match self {
             Self::OpenSystemSettings => "Open System Settings",
             Self::Sleep => "Sleep",
+            Self::LockScreen => "Lock Screen",
             Self::ToggleAppearance => "Toggle System Appearance",
             Self::EmptyTrash => "Empty Trash",
             Self::LogOut => "Log Out",
@@ -58,6 +62,7 @@ impl SystemCommand {
         match self {
             Self::OpenSystemSettings => "Open macOS System Settings",
             Self::Sleep => "Put this Mac to sleep",
+            Self::LockScreen => "Lock this Mac without putting it to sleep",
             Self::ToggleAppearance => "Switch between light and dark appearance",
             Self::EmptyTrash => "Permanently delete every item in the Trash",
             Self::LogOut => "Log out the current macOS user",
@@ -70,6 +75,7 @@ impl SystemCommand {
         match self {
             Self::OpenSystemSettings => &["preferences", "settings", "macos"],
             Self::Sleep => &["suspend", "standby", "power"],
+            Self::LockScreen => &["lock", "screen", "security", "password"],
             Self::ToggleAppearance => &["dark", "light", "theme", "mode"],
             Self::EmptyTrash => &["bin", "delete", "files", "recycle"],
             Self::LogOut => &["logout", "sign out", "session", "user"],
@@ -92,7 +98,9 @@ impl SystemCommand {
             Self::LogOut => Some("Log out now and close all open applications?"),
             Self::Restart => Some("Restart this Mac now?"),
             Self::ShutDown => Some("Shut down this Mac now?"),
-            Self::OpenSystemSettings | Self::Sleep | Self::ToggleAppearance => None,
+            Self::OpenSystemSettings | Self::Sleep | Self::LockScreen | Self::ToggleAppearance => {
+                None
+            }
         }
     }
 
@@ -152,6 +160,7 @@ mod tests {
         for command in [
             SystemCommand::OpenSystemSettings,
             SystemCommand::Sleep,
+            SystemCommand::LockScreen,
             SystemCommand::ToggleAppearance,
         ] {
             assert!(!command.requires_confirmation());
