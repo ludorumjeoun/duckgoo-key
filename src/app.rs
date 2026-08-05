@@ -308,7 +308,7 @@ fn boot() -> (Launcher, Task<Message>) {
         .skip(1)
         .any(|argument| argument == std::ffi::OsStr::new(crate::START_HIDDEN_ARGUMENT));
     let mut window_settings = window::Settings {
-        size: Size::new(760.0, 620.0),
+        size: Size::new(720.0, 520.0),
         position: window::Position::Centered,
         visible: !starts_hidden,
         resizable: false,
@@ -316,7 +316,7 @@ fn boot() -> (Launcher, Task<Message>) {
         minimizable: false,
         decorations: false,
         transparent: true,
-        blur: true,
+        blur: false,
         level: window::Level::AlwaysOnTop,
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -1701,17 +1701,11 @@ fn view(state: &Launcher, _window: window::Id) -> Element<'_, Message> {
         Page::Confirmation => confirmation_view(state),
     };
 
-    let panel = container(content)
-        .padding(20)
+    container(content)
+        .padding(18)
         .width(Fill)
         .height(Fill)
-        .style(panel_style);
-
-    container(panel)
-        .padding(12)
-        .width(Fill)
-        .height(Fill)
-        .style(transparent_style)
+        .style(panel_style)
         .into()
 }
 
@@ -1864,13 +1858,13 @@ fn launcher_view(state: &Launcher) -> Element<'_, Message> {
     let search = text_input(placeholder, &state.query)
         .id(state.query_input.clone())
         .on_input(Message::QueryChanged)
-        .padding([15, 17])
-        .size(19)
+        .padding([13, 15])
+        .size(18)
         .style(search_input_style);
 
     let results = state.results();
     let result_count = results.len();
-    let mut result_list = iced::widget::column![].spacing(5);
+    let mut result_list = iced::widget::column![].spacing(2);
     if results.is_empty() && !state.loading {
         let (empty_title, empty_detail) = match state.search_mode {
             Some(SearchMode::Files) if state.query.trim().chars().count() < 2 => {
@@ -1965,7 +1959,7 @@ fn launcher_view(state: &Launcher) -> Element<'_, Message> {
         container(result_list).height(Fill),
         footer,
     ]
-    .spacing(13)
+    .spacing(11)
     .into()
 }
 
@@ -2712,27 +2706,17 @@ fn panel_style(_: &Theme) -> container::Style {
             r: 0.055,
             g: 0.063,
             b: 0.082,
-            a: 0.96,
+            a: 0.985,
         })
         .border(Border {
-            radius: 18.0.into(),
+            radius: 16.0.into(),
             width: 1.0,
             color: Color {
                 r: 1.0,
                 g: 1.0,
                 b: 1.0,
-                a: 0.10,
+                a: 0.12,
             },
-        })
-        .shadow(Shadow {
-            color: Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.45,
-            },
-            offset: Vector::new(0.0, 12.0),
-            blur_radius: 36.0,
         })
 }
 
@@ -2902,9 +2886,9 @@ fn search_input_style(_theme: &Theme, status: text_input::Status) -> text_input:
         }),
         border: Border {
             radius: 12.0.into(),
-            width: if focused { 1.5 } else { 1.0 },
+            width: 1.0,
             color: if focused {
-                Color { a: 0.75, ..ACCENT }
+                Color { a: 0.52, ..ACCENT }
             } else {
                 Color {
                     r: 1.0,
@@ -3042,10 +3026,10 @@ fn result_button_style(selected: bool, status: button::Status) -> button::Style 
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     let background = if selected {
         Color {
-            r: 0.10,
-            g: 0.26,
-            b: 0.22,
-            a: 0.96,
+            r: 0.075,
+            g: 0.20,
+            b: 0.17,
+            a: 0.98,
         }
     } else if hovered {
         Color {
@@ -3068,7 +3052,7 @@ fn result_button_style(selected: bool, status: button::Status) -> button::Style 
                 r: ACCENT.r,
                 g: ACCENT.g,
                 b: ACCENT.b,
-                a: 0.32,
+                a: 0.20,
             },
         },
         ..button::Style::default()
