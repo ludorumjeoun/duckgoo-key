@@ -13,8 +13,8 @@ reproducible Cloudflare R2 delivery path.
 ## What works
 
 - Native Iced UI with no webview or JavaScript runtime
-- Application discovery in `/Applications`, `/System/Applications`, and
-  `~/Applications`
+- Application discovery in standard macOS application folders, including
+  user-facing CoreServices apps such as Finder and Keychain Access
 - Installed application icons decoded directly from each macOS app bundle
 - Case-insensitive prefix, substring, and subsequence search
 - Pinned and frecency-based ranking
@@ -32,7 +32,9 @@ reproducible Cloudflare R2 delivery path.
   pinning, and deleting Clipboard History entries
 - Atomic local history storage with damaged-file recovery
 - Apple Silicon and Intel `.app`/`.dmg` release jobs
-- Immutable Cloudflare R2 release objects with a checksummed `latest.json`
+- Developer ID-signed, Apple-notarized public releases on immutable Cloudflare
+  R2 objects with a checksummed `latest.json`
+- Separately isolated self-signed packages for private testers
 
 ## Requirements
 
@@ -79,7 +81,8 @@ mise run package
 
 The task uses the mise-managed cargo-packager, builds the release app and DMG,
 and opens `target/release/packages` in Finder. Open the DMG and drag DuckGooKey
-to Applications to install it. Build outputs remain ignored by Git.
+to Applications to install it. These local packages are unsigned development
+outputs, not files for user distribution. Build outputs remain ignored by Git.
 
 For a build without opening Finder:
 
@@ -228,11 +231,16 @@ The main development tasks are:
 
 Push a SemVer tag matching `Cargo.toml`, such as `v0.1.0`. The release workflow
 builds separate Apple Silicon and Intel packages, verifies their architecture
-and checksums, and always retains GitHub Actions artifacts.
+and checksums, and always retains GitHub Actions artifacts. Public R2
+publication requires complete Developer ID signing and Apple notarization;
+missing or partial Apple/R2 configuration fails instead of publishing an
+unsigned fallback.
 
-Cloudflare R2 publishing is enabled only when its repository variables and
-secrets are configured. Versioned objects are never overwritten;
-`latest.json` is updated last so it cannot advertise a partial release.
+For pre-account private testing, the separate **Private Release** workflow uses
+a pinned self-signed certificate, includes the public certificate and
+fingerprint, and keeps the result in short-lived GitHub artifacts rather than
+the public R2 bucket. Versioned R2 objects are never overwritten; `latest.json`
+is updated last so it cannot advertise a partial release.
 
 See [docs/releasing.md](docs/releasing.md) for signing, notarization, R2
 configuration, object layout, and local script usage.

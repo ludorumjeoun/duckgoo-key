@@ -1,8 +1,13 @@
 # Releasing DuckGooKey
 
-DuckGooKey releases are built by `.github/workflows/release.yml`. The workflow
-produces native Apple Silicon and Intel macOS packages, always uploads them as
-GitHub Actions artifacts, and optionally publishes them to Cloudflare R2.
+DuckGooKey has two intentionally separate distribution channels:
+
+- `.github/workflows/release.yml` builds public Apple Silicon and Intel
+  packages. Cloudflare R2 accepts only Developer ID-signed and Apple-notarized
+  output.
+- `.github/workflows/private-release.yml` builds private-test packages with a
+  pinned self-signed certificate. It uploads short-lived GitHub Actions
+  artifacts only and never publishes to the public R2 bucket.
 
 ## Release contract
 
@@ -19,6 +24,15 @@ GitHub Actions artifacts, and optionally publishes them to Cloudflare R2.
 - The release manifest advertises the DMG for each platform.
 - The packaged app sets `LSUIElement` through `backgroundApp`, so the
   menu-bar launcher does not add a Dock icon.
+- Public R2 artifacts must be signed with `Developer ID Application`, have the
+  hardened runtime enabled, and have accepted Apple notarization tickets
+  stapled to both the app and final DMG.
+- A public publication request fails when any Apple or R2 setting is missing or
+  only partially configured. It never silently falls back to an unsigned file.
+- Unsigned output is permitted only when a manual **Release** run explicitly
+  disables R2. Its artifact name contains `UNSIGNED-NOT-FOR-DISTRIBUTION`.
+- Private-signed output has `Private` in every filename, includes the public
+  certificate and its fingerprint, and is never treated as a public release.
 
 The manifest publication date is derived from the annotated tag date, or from
 the release commit date for a lightweight tag. This keeps publication metadata
@@ -41,21 +55,52 @@ toolchain with `mise run icons -- /path/to/source-image.png`.
    git push origin v0.1.0
    ```
 
-Any pushed `v*` tag starts the workflow. Invalid tags or version mismatches
-fail before compilation.
+Any pushed `v*` tag starts the public workflow and requests R2 publication.
+Invalid tags, version mismatches, incomplete Developer ID configuration, a
+failed notarization, or incomplete R2 configuration fail the run.
 
 ### Manual release
 
 Open **Actions → Release → Run workflow**, enter an existing matching tag, and
 choose whether R2 publishing is requested. The workflow checks out that tag;
-it never releases an arbitrary untagged branch.
+it never releases an arbitrary untagged branch. Disabling R2 with no Apple
+secrets creates clearly labelled unsigned diagnostic artifacts. Signing and
+notarization secret groups must always be either both complete or both absent.
 
-## Apple signing and notarization
+### Private release
 
-Signing and notarization are optional gates. With no Apple secrets, the
-workflow succeeds and uploads unsigned GitHub artifacts. Partial groups are
-reported and skipped; a complete signing group enables signing, and a complete
-notarization group additionally enables notarization and stapling.
+Open **Actions → Private Release → Run workflow** and enter an existing matching
+tag. This workflow requires the protected `private-release` environment and a
+stable private signing identity. It produces 14-day GitHub Actions artifacts;
+there is deliberately no R2 publishing job.
+
+## Apple Developer account
+
+An individual can join the paid Apple Developer Program without a registered
+company or D-U-N-S Number. This is the quickest path for DuckGooKey. The annual
+fee is USD 99, subject to local pricing, and the personal legal name is used as
+the public developer identity. A free Apple Account supports local development
+but does not provide the Developer ID certificate and notarization needed for
+normal distribution outside the Mac App Store.
+
+Apple's current references are:
+
+- [Program enrollment](https://developer.apple.com/help/account/membership/program-enrollment)
+- [Membership comparison](https://developer.apple.com/support/compare-memberships/)
+- [Developer ID](https://developer.apple.com/support/developer-id/)
+- [D-U-N-S requirements](https://developer.apple.com/help/account/membership/D-U-N-S/)
+- [Account and membership updates](https://developer.apple.com/help/account/membership/updating-your-account-information/)
+
+An organization enrollment requires a legal entity and D-U-N-S Number. Apple
+allows an eligible founder or cofounder to request conversion from an
+individual membership later, after supplying the organization information and
+supporting documents.
+
+## Public Developer ID signing and notarization
+
+After joining the paid program, create a **Developer ID Application**
+certificate through the Apple Developer account or Xcode and export the
+identity with its private key as a password-protected `.p12`.
 
 Configure these GitHub Actions secrets to sign:
 
@@ -63,14 +108,14 @@ Configure these GitHub Actions secrets to sign:
 | --- | --- |
 | `APPLE_CERTIFICATE` | Base64-encoded Developer ID Application `.p12` |
 | `APPLE_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12` |
-| `APPLE_SIGNING_IDENTITY` | Full identity, for example `Developer ID Application: Company (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | Full identity, for example `Developer ID Application: Legal Name (TEAMID)` |
 
 Configure all of these as well to notarize:
 
 | Secret | Purpose |
 | --- | --- |
 | `APPLE_ID` | Apple developer account email |
-| `APPLE_PASSWORD` | Apple app-specific password |
+| `APPLE_PASSWORD` | Apple app-specific password used by `notarytool` |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
 Encode the certificate without writing it to logs:
@@ -79,9 +124,81 @@ Encode the certificate without writing it to logs:
 base64 < "Developer ID Application.p12" | pbcopy
 ```
 
-`cargo-packager` imports the certificate into a temporary keychain, signs the
-app and DMG, submits the app through `notarytool`, and staples the accepted
-ticket. The workflow then verifies the code signature and stapled ticket.
+`cargo-packager` imports the P12 into a temporary keychain, enables the hardened
+runtime, signs the app and DMG, submits the app through `notarytool`, and staples
+the accepted app ticket. The workflow then submits the final DMG separately,
+requires an `Accepted` result, staples that DMG ticket, and checks:
+
+- strict app and DMG code-signature validity;
+- configured signing authority and Team ID;
+- app and DMG stapled-ticket validity;
+- DMG filesystem integrity; and
+- Gatekeeper assessment for both the app and DMG.
+
+The R2 job can only download artifacts whose Actions name ends in
+`public-notarized`.
+
+## Private self-signed distribution
+
+Private signing provides a stable integrity identity before the paid Apple
+account is ready. It is not a replacement for Developer ID. Generate the
+identity once, outside the repository:
+
+```bash
+./scripts/generate-private-signing-identity.sh \
+  "$HOME/Documents/DuckGooKey-private-signing"
+```
+
+The script prompts for the P12 password without echoing it. For non-interactive
+automation, provide `DUCKGOOKEY_PRIVATE_SIGNING_PASSWORD` through a secret
+environment rather than putting the value in a shell command or script.
+
+The generator retains only an encrypted P12, public PEM/DER certificates, and
+fingerprints. It removes the standalone private-key file before publishing the
+output directory. Back up the P12 and password securely; reusing this stable
+identity prevents testers from having to trust a new certificate every build.
+
+Create a GitHub environment named `private-release`, ideally with required
+reviewers, and configure:
+
+| Kind | Name | Purpose |
+| --- | --- | --- |
+| Secret | `PRIVATE_SIGNING_CERTIFICATE` | Base64-encoded private signing `.p12` |
+| Secret | `PRIVATE_SIGNING_CERTIFICATE_PASSWORD` | P12 export password |
+| Variable | `PRIVATE_SIGNING_CERT_SHA256` | DER certificate SHA-256 from `signing-metadata.env` |
+
+Encode the private P12 without printing it:
+
+```bash
+base64 < "$HOME/Documents/DuckGooKey-private-signing/DuckGooKey-Private-Code-Signing.p12" | pbcopy
+```
+
+The private workflow decodes the P12 into runner-temporary storage, pins the
+exact DER certificate SHA-256, imports it into a temporary keychain, and adds a
+code-signing trust setting only while signing. It signs every Mach-O file, the
+outer app, and a freshly rebuilt DMG with hardened runtime and no Apple
+timestamp. It verifies both signatures while the trust is active, removes the
+temporary trust and keychain, and uploads only:
+
+- the signed private DMG and resource-safe app ZIP;
+- SHA-256 checksums;
+- the public `.cer` certificate; and
+- a `SIGNING.txt` file containing the certificate fingerprint and validity.
+
+The workflow rejects any staged `.p12`, private key, or keychain file.
+
+### Tester trust model
+
+A private certificate proves that two builds were signed by the same pinned
+identity only after the tester independently verifies and trusts its SHA-256
+fingerprint. It is not trusted by Apple and cannot be notarized. Internet-downloaded
+files can therefore still show a Gatekeeper warning even after the certificate
+is added in Keychain Access. Testers may need macOS's normal **Open** or
+**Privacy & Security → Open Anyway** approval. Do not instruct testers to remove
+quarantine attributes or disable Gatekeeper.
+
+For a managed organization, distribute the public certificate and trust policy
+through MDM. Never give testers the P12 or its password.
 
 ## Cloudflare R2 configuration
 
@@ -104,8 +221,8 @@ Scope the R2 token to the release bucket with object read/write and bucket list
 permissions. Do not grant account-wide administration. The public base URL must
 serve that bucket root through an R2 custom domain (or another public R2 URL).
 
-If any R2 credential or variable is absent, the publish job exits successfully
-without contacting R2. GitHub artifacts remain available.
+When R2 publication is requested, any missing credential or variable fails the
+workflow. Only an explicit manual `publish_r2=false` skips the R2 job normally.
 
 ## R2 object layout and immutability
 
@@ -163,7 +280,8 @@ Build a manifest from already-staged artifacts:
   --output "/path/to/release assets/latest.json"
 ```
 
-Publish those artifacts using AWS CLI v2 and temporary environment credentials:
+Publish already Developer ID-signed and Apple-notarized public artifacts using
+AWS CLI v2 and temporary environment credentials:
 
 ```bash
 AWS_ACCESS_KEY_ID=... \
@@ -178,4 +296,7 @@ AWS_DEFAULT_REGION=auto \
   --manifest "/path/to/release assets/latest.json"
 ```
 
-Never place credential values in command arguments or committed files.
+`publish-r2.sh` fails when either AWS credential is absent; it never reports a
+requested publication as a successful skip. Never place credential values in
+command arguments or committed files. Private-signed artifacts must not be
+passed to this script or uploaded beneath the public release object layout.
