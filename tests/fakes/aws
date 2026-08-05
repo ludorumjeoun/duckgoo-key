@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Small stateful AWS CLI fake for release-publisher policy tests."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    print(f"fake aws: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def option(arguments: list[str], name: str) -> str:
+    try:
+        index = arguments.index(name)
+        return arguments[index + 1]
+    except (ValueError, IndexError):
+        fail(f"missing option {name}")
+
+
+def object_paths(root: Path, key: str) -> tuple[Path, Path]:
+    relative = Path(key)
+    if relative.is_absolute() or ".." in relative.parts:
+        fail(f"unsafe object key: {key}")
+    return root / "objects" / relative, root / "metadata" / Path(f"{key}.json")
+
+
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("--"):
+    if arguments[0] == "--endpoint-url":
+        arguments = arguments[2:]
+    elif arguments[0] == "--no-cli-pager":
+        arguments = arguments[1:]
+    else:
+        break
+
+if len(arguments) < 2 or arguments[0] != "s3api":
+    fail("only s3api operations are supported")
+
+operation = arguments[1]
+operation_arguments = arguments[2:]
+state_root = Path(os.environ["FAKE_R2_DIR"])
+log_path = Path(os.environ["FAKE_R2_LOG"])
+state_root.mkdir(parents=True, exist_ok=True)
+log_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def log(message: str) -> None:
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"{message}\n")
+
+
+def metadata_for(path: Path, metadata_path: Path) -> dict[str, object]:
+    if not path.is_file() or not metadata_path.is_file():
+        fail(f"object does not exist: {path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["ContentLength"] = path.stat().st_size
+    return metadata
+
+
+if operation == "list-objects-v2":
+    prefix = option(operation_arguments, "--prefix")
+    objects_root = state_root / "objects"
+    keys = []
+    if objects_root.is_dir():
+        keys = sorted(
+            str(path.relative_to(objects_root))
+            for path in objects_root.rglob("*")
+            if path.is_file() and str(path.relative_to(objects_root)).startswith(prefix)
+        )
+    log(f"list {prefix}")
+    print(json.dumps({"Contents": [{"Key": key} for key in keys[:1]]}))
+elif operation == "head-object":
+    key = option(operation_arguments, "--key")
+    object_path, metadata_path = object_paths(state_root, key)
+    log(f"head {key}")
+    print(json.dumps(metadata_for(object_path, metadata_path)))
+elif operation == "get-object":
+    key = option(operation_arguments, "--key")
+    object_path, metadata_path = object_paths(state_root, key)
+    metadata = metadata_for(object_path, metadata_path)
+
+    value_options = {
+        "--bucket",
+        "--key",
+        "--output",
+    }
+    positional = []
+    index = 0
+    while index < len(operation_arguments):
+        argument = operation_arguments[index]
+        if argument in value_options:
+            index += 2
+        elif argument.startswith("--"):
+            fail(f"unsupported get-object option: {argument}")
+        else:
+            positional.append(argument)
+            index += 1
+    if len(positional) != 1:
+        fail("get-object requires one output path")
+    destination = Path(positional[0])
+    shutil.copyfile(object_path, destination)
+    log(f"get {key}")
+    print(json.dumps(metadata))
+elif operation == "put-object":
+    key = option(operation_arguments, "--key")
+    source = Path(option(operation_arguments, "--body"))
+    object_path, metadata_path = object_paths(state_root, key)
+    existing_metadata = None
+    if object_path.is_file() and metadata_path.is_file():
+        existing_metadata = metadata_for(object_path, metadata_path)
+
+    condition = "none"
+    if "--if-none-match" in operation_arguments:
+        condition = f"if-none-match={option(operation_arguments, '--if-none-match')}"
+        if existing_metadata is not None:
+            fail(f"if-none-match failed for {key}")
+    if "--if-match" in operation_arguments:
+        expected_etag = option(operation_arguments, "--if-match")
+        condition = f"if-match={expected_etag}"
+        if existing_metadata is None or existing_metadata.get("ETag") != expected_etag:
+            fail(f"if-match failed for {key}")
+
+    body = source.read_bytes()
+    digest = hashlib.md5(body).hexdigest()  # noqa: S324 - test ETag only
+    metadata_value = option(operation_arguments, "--metadata")
+    metadata_key, metadata_digest = metadata_value.split("=", 1)
+    metadata = {
+        "CacheControl": option(operation_arguments, "--cache-control"),
+        "ContentLength": len(body),
+        "ContentType": option(operation_arguments, "--content-type"),
+        "ETag": f'"{digest}"',
+        "Metadata": {metadata_key: metadata_digest},
+    }
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_bytes(body)
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    log(f"put {key} {condition}")
+    print(json.dumps({"ETag": metadata["ETag"]}))
+else:
+    fail(f"unsupported operation: {operation}")

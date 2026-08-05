@@ -2,9 +2,11 @@
 
 DuckGooKey has two intentionally separate distribution channels:
 
-- `.github/workflows/release.yml` builds public Apple Silicon and Intel
-  packages. Cloudflare R2 accepts only Developer ID-signed and Apple-notarized
-  output.
+- The public channel builds Apple Silicon and Intel packages with either
+  `mise run release-local` or `.github/workflows/release.yml`. Both tracks call
+  `scripts/package-macos-release-arch.sh`, produce the same artifact contract,
+  and can publish to Cloudflare R2 only after Developer ID signing and Apple
+  notarization succeed.
 - `.github/workflows/private-release.yml` builds private-test packages with a
   pinned self-signed certificate. It uploads short-lived GitHub Actions
   artifacts only and never publishes to the public R2 bucket.
@@ -17,6 +19,8 @@ DuckGooKey has two intentionally separate distribution channels:
   cargo-packager, Python, jq, and AWS CLI versions used by the workflow.
 - Both `aarch64-apple-darwin` and `x86_64-apple-darwin` are built with
   `cargo build --release --locked`.
+- Local and GitHub public builds use the same per-architecture packaging,
+  notarization, signature verification, and staging script.
 - The mise-managed cargo-packager creates a `.app` and `.dmg` for each
   architecture.
 - The `.app` is preserved as a resource-safe `.app.zip` for download.
@@ -45,7 +49,12 @@ toolchain with `mise run icons -- /path/to/source-image.png`.
 
 ## Starting a release
 
-### Automatic tag release
+The local and GitHub public tracks are alternatives for publishing a version.
+Do not start both publishers for the same tag. Signed and notarized packages
+contain timestamps and tickets, so two builds of one version are not expected
+to be byte-identical.
+
+### Create the release tag
 
 1. Update `Cargo.toml` to the intended version and merge the change.
 2. Create and push the matching tag:
@@ -55,17 +64,59 @@ toolchain with `mise run icons -- /path/to/source-image.png`.
    git push origin v0.1.0
    ```
 
-Any pushed `v*` tag starts the public workflow and requests R2 publication.
-Invalid tags, version mismatches, incomplete Developer ID configuration, a
-failed notarization, or incomplete R2 configuration fail the run.
+Any pushed `v*` tag starts the public workflow in **build and verify only**
+mode. It does not mutate R2. Invalid tags, version mismatches, incomplete
+Developer ID configuration, or failed notarization fail the run.
 
-### Manual release
+### Local public release
+
+The local track performs the full two-architecture release on a Mac. It
+requires a clean working tree, `HEAD` at the matching tag, a Developer ID
+Application identity, and Apple notarization credentials. The default command
+builds, signs, notarizes, verifies, writes `latest.json`, and opens the artifact
+folder without changing R2:
+
+```bash
+export APPLE_SIGNING_IDENTITY='Developer ID Application: Legal Name (TEAMID)'
+export APPLE_TEAM_ID='TEAMID'
+export APPLE_KEYCHAIN_PROFILE='duckgookey-notary'
+
+mise run release-local -- --tag v0.1.0
+```
+
+Add `--publish-r2` only when this machine should publish the release:
+
+```bash
+export CLOUDFLARE_R2_ACCESS_KEY_ID='...'
+export CLOUDFLARE_R2_SECRET_ACCESS_KEY='...'
+export CLOUDFLARE_R2_BUCKET='duckgookey-releases'
+export CLOUDFLARE_R2_ENDPOINT='https://ACCOUNT_ID.r2.cloudflarestorage.com'
+export CLOUDFLARE_R2_PUBLIC_BASE_URL='https://updates.key.duckgoo.net'
+
+mise run release-local -- --tag v0.1.0 --publish-r2
+```
+
+Publication additionally requires the same tag on `origin` at the release
+commit. If R2 or CDN verification fails after packaging, the exact signed bytes
+and their `public-release.json` receipt remain in
+`target/release/public/v0.1.0`. Retry those bytes instead of rebuilding:
+
+```bash
+mise run release-local -- \
+  --tag v0.1.0 \
+  --publish-r2 \
+  --reuse-artifacts
+```
+
+### GitHub public release
 
 Open **Actions → Release → Run workflow**, enter an existing matching tag, and
-choose whether R2 publishing is requested. The workflow checks out that tag;
-it never releases an arbitrary untagged branch. Disabling R2 with no Apple
-secrets creates clearly labelled unsigned diagnostic artifacts. Signing and
-notarization secret groups must always be either both complete or both absent.
+choose whether R2 publishing is requested. This is the second full public
+release track. The workflow checks out that tag; it never releases an arbitrary
+untagged branch. Enabling R2 is an explicit publication action. Disabling R2
+with no Apple secrets creates clearly labelled unsigned diagnostic artifacts.
+Signing and notarization secret groups must always be either both complete or
+both absent.
 
 ### Private release
 
@@ -124,10 +175,32 @@ Encode the certificate without writing it to logs:
 base64 < "Developer ID Application.p12" | pbcopy
 ```
 
-`cargo-packager` imports the P12 into a temporary keychain, enables the hardened
+For the local track, install the Developer ID Application certificate and its
+private key in the login keychain. Confirm the full identity string with:
+
+```bash
+security find-identity -v -p codesigning
+```
+
+Store notarization credentials in Keychain once. Running `store-credentials`
+without credential flags prompts interactively, so the app-specific password
+does not enter shell history:
+
+```bash
+xcrun notarytool store-credentials "duckgookey-notary"
+```
+
+The default local release uses that profile through
+`APPLE_KEYCHAIN_PROFILE`. As an alternative, pass `--notary-auth apple-id` and
+provide `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` in the environment.
+The local command can also use a base64 P12 by passing
+`--signing-source p12-env`, but the installed keychain identity is preferred.
+
+In GitHub, `cargo-packager` imports the P12 into a temporary keychain. Locally,
+it uses the selected installed identity. In both tracks it enables the hardened
 runtime, signs the app and DMG, submits the app through `notarytool`, and staples
-the accepted app ticket. The workflow then submits the final DMG separately,
-requires an `Accepted` result, staples that DMG ticket, and checks:
+the accepted app ticket. The shared packaging script submits the final DMG
+separately, requires an `Accepted` result, staples that DMG ticket, and checks:
 
 - strict app and DMG code-signature validity;
 - configured signing authority and Team ID;
@@ -215,14 +288,23 @@ It also needs three non-sensitive repository variables:
 | --- | --- |
 | `CLOUDFLARE_R2_BUCKET` | `duckgookey-releases` |
 | `CLOUDFLARE_R2_ENDPOINT` | `https://ACCOUNT_ID.r2.cloudflarestorage.com` |
-| `CLOUDFLARE_R2_PUBLIC_BASE_URL` | `https://downloads.example.com` |
+| `CLOUDFLARE_R2_PUBLIC_BASE_URL` | `https://updates.key.duckgoo.net` |
 
 Scope the R2 token to the release bucket with object read/write and bucket list
-permissions. Do not grant account-wide administration. The public base URL must
-serve that bucket root through an R2 custom domain (or another public R2 URL).
+permissions. Do not grant account-wide administration. Connect
+`updates.key.duckgoo.net` from the bucket's **Settings → Custom Domains** in
+Cloudflare R2. This can coexist with `duckgoo.net` on Cloudflare Pages; do not
+manually point the hostname at an `r2.dev` URL.
+
+Cloudflare references:
+
+- [Public buckets and custom domains](https://developers.cloudflare.com/r2/buckets/public-buckets/)
+- [AWS CLI with R2](https://developers.cloudflare.com/r2/get-started/cli/)
+- [S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
 
 When R2 publication is requested, any missing credential or variable fails the
-workflow. Only an explicit manual `publish_r2=false` skips the R2 job normally.
+workflow. Tag pushes never publish. A GitHub manual run publishes only with
+`publish_r2=true`, and the local track publishes only with `--publish-r2`.
 
 ## R2 object layout and immutability
 
@@ -244,9 +326,14 @@ Versioned objects use a one-year immutable cache policy. Re-running a release
 accepts an existing object only when its stored SHA-256 metadata and size match;
 otherwise publishing fails instead of overwriting history. New versioned
 objects are created with `If-None-Match: *`, so concurrent runs cannot overwrite
-one another between the existence check and upload. `latest.json` is the only
-mutable object and is written last, after every immutable object has been
-uploaded and verified.
+one another between the existence check and upload.
+
+Before advertising a release, the publisher downloads both DMGs and
+`release.json` through the public custom domain and requires byte-for-byte
+matches. `latest.json` is the only mutable object. It is written last using an
+ETag condition, rejects SemVer rollback, and rejects different data for an
+already published version. The publisher finally downloads `latest.json`
+through the custom domain and compares it with the local manifest.
 
 The manifest schema is:
 
@@ -256,18 +343,21 @@ The manifest schema is:
   "pub_date": "2026-07-31T12:00:00Z",
   "platforms": {
     "macos-aarch64": {
-      "url": "https://downloads.example.com/releases/v0.1.0/DuckGooKey-0.1.0-macos-aarch64.dmg",
+      "url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-aarch64.dmg",
       "sha256": "64 lowercase hexadecimal characters"
     },
     "macos-x86_64": {
-      "url": "https://downloads.example.com/releases/v0.1.0/DuckGooKey-0.1.0-macos-x86_64.dmg",
+      "url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-x86_64.dmg",
       "sha256": "64 lowercase hexadecimal characters"
     }
   }
 }
 ```
 
-## Local script checks
+## Lower-level release utilities
+
+`mise run release-local` is the normal local entry point. The scripts below are
+useful when validating or recovering already-staged public artifacts.
 
 Build a manifest from already-staged artifacts:
 
@@ -275,7 +365,7 @@ Build a manifest from already-staged artifacts:
 ./scripts/build-release-manifest.sh \
   --version 0.1.0 \
   --pub-date 2026-07-31T12:00:00Z \
-  --base-url https://downloads.example.com \
+  --base-url https://updates.key.duckgoo.net \
   --artifacts-dir "/path/to/release assets" \
   --output "/path/to/release assets/latest.json"
 ```
@@ -291,12 +381,13 @@ AWS_DEFAULT_REGION=auto \
   --version 0.1.0 \
   --bucket duckgookey-releases \
   --endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com \
-  --base-url https://downloads.example.com \
+  --base-url https://updates.key.duckgoo.net \
   --artifacts-dir "/path/to/release assets" \
   --manifest "/path/to/release assets/latest.json"
 ```
 
-`publish-r2.sh` fails when either AWS credential is absent; it never reports a
-requested publication as a successful skip. Never place credential values in
-command arguments or committed files. Private-signed artifacts must not be
-passed to this script or uploaded beneath the public release object layout.
+`publish-r2.sh` requires AWS CLI v2, Python 3, jq, and curl. It fails when either
+AWS credential is absent; it never reports a requested publication as a
+successful skip. Never place credential values in command arguments or
+committed files. Private-signed artifacts must not be passed to this script or
+uploaded beneath the public release object layout.

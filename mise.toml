@@ -29,11 +29,16 @@ cargo fmt --all -- --check
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
+bash tests/release-scripts.sh
 """
 
 [tasks.package]
 description = "Build the local macOS app and DMG"
 run = "./scripts/build-local.sh"
+
+[tasks.release-local]
+description = "Build a signed and notarized two-architecture public release locally"
+run = "./scripts/release-local.sh"
 
 [tasks.icons]
 description = "Rebuild the brand icon assets from a source image"
