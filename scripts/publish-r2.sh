@@ -90,8 +90,7 @@ done
 [[ -n "$manifest" ]] || die "--manifest is required"
 
 if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
-  printf 'publish-r2: AWS credentials are not configured; skipping R2 publishing.\n' >&2
-  exit 0
+  die "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required"
 fi
 
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then

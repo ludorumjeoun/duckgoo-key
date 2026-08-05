@@ -156,13 +156,14 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --target "$TARGET"
 
-      - name: Configure package and optional Apple signing
+      - name: Configure Apple release policy and package
         id: packager-config
         shell: bash
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
+          PUBLISH_REQUESTED: ${{ needs.prepare.outputs.publish_requested }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -187,13 +188,9 @@ jobs:
             fi
           done
 
-          signing_enabled="false"
-          if (( signing_count == 3 )); then
-            signing_enabled="true"
-          elif (( signing_count > 0 )); then
-            echo "::warning::Apple signing configuration is incomplete; this build will remain unsigned."
-          else
-            echo "::notice::Apple signing secrets are not configured; building unsigned artifacts."
+          if (( signing_count != 0 && signing_count != 3 )); then
+            echo "::error::Apple signing secrets are incomplete. Configure APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, and APPLE_SIGNING_IDENTITY together."
+            exit 1
           fi
 
           notarization_count=0
@@ -203,13 +200,32 @@ jobs:
             fi
           done
 
+          if (( notarization_count != 0 && notarization_count != 3 )); then
+            echo "::error::Apple notarization secrets are incomplete. Configure APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID together."
+            exit 1
+          fi
+
+          signing_enabled="false"
           notarization_enabled="false"
-          if [[ "$signing_enabled" == "true" ]] && (( notarization_count == 3 )); then
+          distribution_label="UNSIGNED-NOT-FOR-DISTRIBUTION"
+          if (( signing_count == 0 && notarization_count == 0 )); then
+            if [[ "$PUBLISH_REQUESTED" == "true" ]]; then
+              echo "::error::R2 publication requires Developer ID signing and Apple notarization. Configure both Apple secret groups."
+              exit 1
+            fi
+            echo "::notice::Building unsigned diagnostic artifacts because R2 publication is disabled."
+          elif (( signing_count == 3 && notarization_count == 3 )); then
+            if [[ "$APPLE_SIGNING_IDENTITY" != "Developer ID Application:"* ]]; then
+              echo "::error::APPLE_SIGNING_IDENTITY must be a Developer ID Application identity."
+              exit 1
+            fi
+            signing_enabled="true"
             notarization_enabled="true"
-          elif (( notarization_count > 0 && notarization_count < 3 )); then
-            echo "::warning::Apple notarization configuration is incomplete; notarization will be skipped."
-          elif [[ "$signing_enabled" == "true" ]]; then
-            echo "::notice::Apple notarization secrets are not configured; producing a signed, non-notarized build."
+            distribution_label="public-notarized"
+            echo "::notice::Developer ID signing and Apple notarization are enabled."
+          else
+            echo "::error::Developer ID signing and Apple notarization must be configured together."
+            exit 1
           fi
 
           out_dir="$RUNNER_TEMP/duckgookey-packages/$PLATFORM"
@@ -265,6 +281,7 @@ jobs:
             printf 'out_dir=%s\n' "$out_dir"
             printf 'signing_enabled=%s\n' "$signing_enabled"
             printf 'notarization_enabled=%s\n' "$notarization_enabled"
+            printf 'distribution_label=%s\n' "$distribution_label"
           } >> "$GITHUB_OUTPUT"
 
       - name: Package app and DMG
@@ -283,8 +300,8 @@ jobs:
           set -euo pipefail
 
           # GitHub exposes an unset secret as an empty environment variable.
-          # cargo-packager checks variable presence, so remove disabled groups
-          # entirely to keep signing and notarization genuinely optional.
+          # cargo-packager checks variable presence, so remove both groups for
+          # an explicitly requested unsigned diagnostic build.
           if [[ "$SIGNING_ENABLED" != "true" ]]; then
             unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
           fi
@@ -297,6 +314,68 @@ jobs:
             --target "$TARGET" \
             --formats app,dmg
 
+      - name: Notarize and staple final DMG
+        if: steps.packager-config.outputs.notarization_enabled == 'true'
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PACKAGE_DIR: ${{ steps.packager-config.outputs.out_dir }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          dmg_candidates=("$PACKAGE_DIR"/*.dmg)
+          if (( ${#dmg_candidates[@]} != 1 )); then
+            echo "::error::Expected exactly one DMG in $PACKAGE_DIR; found ${#dmg_candidates[@]}."
+            exit 1
+          fi
+
+          dmg_path="${dmg_candidates[0]}"
+          result_path="$RUNNER_TEMP/duckgookey-notary-$PLATFORM.json"
+          log_path="$RUNNER_TEMP/duckgookey-notary-$PLATFORM.log.json"
+
+          if ! xcrun notarytool submit "$dmg_path" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --output-format json > "$result_path"; then
+            submission_id="$(jq -r '.id // empty' "$result_path" 2>/dev/null || true)"
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                "$log_path" || true
+              [[ ! -s "$log_path" ]] || cat "$log_path"
+            fi
+            [[ ! -s "$result_path" ]] || cat "$result_path"
+            echo "::error::Apple rejected or could not process the final DMG."
+            exit 1
+          fi
+
+          submission_id="$(jq -r '.id // empty' "$result_path")"
+          status="$(jq -r '.status // empty' "$result_path")"
+          if [[ "$status" != "Accepted" ]]; then
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                "$log_path" || true
+              [[ ! -s "$log_path" ]] || cat "$log_path"
+            fi
+            cat "$result_path"
+            echo "::error::Final DMG notarization status is '$status', not 'Accepted'."
+            exit 1
+          fi
+
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+
       - name: Verify and stage release assets
         id: stage
         shell: bash
@@ -307,6 +386,8 @@ jobs:
           PACKAGE_DIR: ${{ steps.packager-config.outputs.out_dir }}
           SIGNING_ENABLED: ${{ steps.packager-config.outputs.signing_enabled }}
           NOTARIZATION_ENABLED: ${{ steps.packager-config.outputs.notarization_enabled }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
 
@@ -325,9 +406,27 @@ jobs:
 
           if [[ "$SIGNING_ENABLED" == "true" ]]; then
             codesign --verify --deep --strict --verbose=2 "$app_path"
+            signature_details="$(codesign --display --verbose=4 "$app_path" 2>&1)"
+            if ! grep -Fq "Authority=$APPLE_SIGNING_IDENTITY" <<< "$signature_details"; then
+              echo "::error::Packaged app was not signed by the configured Developer ID identity."
+              exit 1
+            fi
+            if ! grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" <<< "$signature_details"; then
+              echo "::error::Packaged app TeamIdentifier does not match APPLE_TEAM_ID."
+              exit 1
+            fi
+            if ! grep -Eq '^CodeDirectory .*flags=.*\(runtime\)' <<< "$signature_details"; then
+              echo "::error::Packaged app does not have hardened runtime enabled."
+              exit 1
+            fi
+            if ! grep -Fq 'Timestamp=' <<< "$signature_details"; then
+              echo "::error::Packaged app does not contain a secure signing timestamp."
+              exit 1
+            fi
           fi
           if [[ "$NOTARIZATION_ENABLED" == "true" ]]; then
             xcrun stapler validate "$app_path"
+            spctl --assess --type execute --verbose=4 "$app_path"
           fi
 
           shopt -s nullglob
@@ -336,8 +435,18 @@ jobs:
             echo "::error::Expected exactly one DMG in $PACKAGE_DIR; found ${#dmg_candidates[@]}."
             exit 1
           fi
+          dmg_path="${dmg_candidates[0]}"
+          hdiutil verify "$dmg_path"
           if [[ "$SIGNING_ENABLED" == "true" ]]; then
-            codesign --verify --strict --verbose=2 "${dmg_candidates[0]}"
+            codesign --verify --strict --verbose=2 "$dmg_path"
+          fi
+          if [[ "$NOTARIZATION_ENABLED" == "true" ]]; then
+            xcrun stapler validate "$dmg_path"
+            spctl --assess \
+              --type open \
+              --context context:primary-signature \
+              --verbose=4 \
+              "$dmg_path"
           fi
 
           release_dir="$RUNNER_TEMP/duckgookey-release/$PLATFORM"
@@ -347,7 +456,7 @@ jobs:
           app_zip_name="DuckGooKey-$VERSION-$PLATFORM.app.zip"
           checksums_name="DuckGooKey-$VERSION-$PLATFORM.SHA256SUMS"
 
-          mv "${dmg_candidates[0]}" "$release_dir/$dmg_name"
+          mv "$dmg_path" "$release_dir/$dmg_name"
           ditto -c -k --keepParent --sequesterRsrc \
             "$app_path" \
             "$release_dir/$app_zip_name"
@@ -362,7 +471,7 @@ jobs:
       - name: Upload GitHub build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: DuckGooKey-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}
+          name: DuckGooKey-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}-${{ steps.packager-config.outputs.distribution_label }}
           path: ${{ steps.stage.outputs.release_dir }}
           if-no-files-found: error
           retention-days: 30
@@ -414,9 +523,8 @@ jobs:
 
           if (( ${#missing[@]} > 0 )); then
             printf -v missing_list '%s, ' "${missing[@]}"
-            echo "::warning::R2 publishing skipped; missing ${missing_list%, }."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::R2 publishing was requested but is missing ${missing_list%, }."
+            exit 1
           fi
 
           echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -425,7 +533,7 @@ jobs:
         if: steps.r2.outputs.enabled == 'true'
         uses: actions/download-artifact@v8
         with:
-          pattern: DuckGooKey-${{ needs.prepare.outputs.version }}-macos-*
+          pattern: DuckGooKey-${{ needs.prepare.outputs.version }}-macos-*-public-notarized
           path: release-assets
           merge-multiple: true
 
