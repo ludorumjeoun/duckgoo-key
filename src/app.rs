@@ -1968,6 +1968,14 @@ fn restore_input_source(state: &mut Launcher) {
 }
 
 fn poll_native_events(state: &mut Launcher) -> Task<Message> {
+    let quick_look_shortcut_enabled = state.visible && state.page == Page::Launcher;
+    if let Some(integrations) = state.integrations.as_mut()
+        && let Err(error) = integrations.set_quick_look_hotkey_enabled(quick_look_shortcut_enabled)
+    {
+        state.notice = Some(Notice::error(format!(
+            "Quick Look shortcut is unavailable: {error}"
+        )));
+    }
     let events = state
         .integrations
         .as_ref()
@@ -1991,6 +1999,12 @@ fn handle_integration_event(state: &mut Launcher, event: IntegrationEvent) -> Ta
             } else {
                 show_launcher(state)
             }
+        }
+        IntegrationEvent::ToggleQuickLook => {
+            if state.visible && state.page == Page::Launcher {
+                toggle_selected_quick_look(state);
+            }
+            Task::none()
         }
         IntegrationEvent::ShowLauncher => show_launcher(state),
         IntegrationEvent::SetLaunchAtLogin(enabled) => {

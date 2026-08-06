@@ -1,4 +1,4 @@
-use global_hotkey::hotkey::HotKey;
+use global_hotkey::hotkey::{Code, HotKey, Modifiers as GlobalHotKeyModifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::ImageFormat;
 use tracing::warn;
@@ -14,6 +14,7 @@ const QUIT_MENU_ID: &str = "duckgookey.quit";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationEvent {
     ToggleLauncher,
+    ToggleQuickLook,
     ShowLauncher,
     SetLaunchAtLogin(bool),
     Quit,
@@ -22,6 +23,8 @@ pub enum IntegrationEvent {
 pub struct DesktopIntegrations {
     hotkey_manager: Option<GlobalHotKeyManager>,
     launcher_hotkey: Option<HotKey>,
+    quick_look_hotkey: Option<HotKey>,
+    quick_look_hotkey_unavailable: bool,
     tray_icon: Option<TrayIcon>,
     show_menu_id: MenuId,
     launch_at_login_menu_id: MenuId,
@@ -74,6 +77,8 @@ impl DesktopIntegrations {
         Self {
             hotkey_manager,
             launcher_hotkey,
+            quick_look_hotkey: None,
+            quick_look_hotkey_unavailable: false,
             tray_icon,
             show_menu_id,
             launch_at_login_menu_id,
@@ -133,13 +138,63 @@ impl DesktopIntegrations {
         }
     }
 
+    /// Registers Command-Y only while the launcher can act on it. This lets the
+    /// system consume the shortcut before Iced's focused text input can insert
+    /// a literal `y`.
+    pub fn set_quick_look_hotkey_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            if self.quick_look_hotkey.is_some() || self.quick_look_hotkey_unavailable {
+                return Ok(());
+            }
+
+            let Some(manager) = self.hotkey_manager.as_ref() else {
+                self.quick_look_hotkey_unavailable = true;
+                return Err("global shortcut manager is unavailable".to_owned());
+            };
+            let hotkey = quick_look_hotkey();
+            match manager.register(hotkey) {
+                Ok(()) => {
+                    self.quick_look_hotkey = Some(hotkey);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.quick_look_hotkey_unavailable = true;
+                    Err(format!(
+                        "could not register the ⌘Y Quick Look shortcut: {error}"
+                    ))
+                }
+            }
+        } else {
+            let Some(hotkey) = self.quick_look_hotkey.take() else {
+                self.quick_look_hotkey_unavailable = false;
+                return Ok(());
+            };
+            let Some(manager) = self.hotkey_manager.as_ref() else {
+                return Err("global shortcut manager is unavailable".to_owned());
+            };
+            manager.unregister(hotkey).map_err(|error| {
+                format!("could not release the ⌘Y Quick Look shortcut: {error}")
+            })?;
+            self.quick_look_hotkey_unavailable = false;
+            Ok(())
+        }
+    }
+
     pub fn drain_events(&self) -> Vec<IntegrationEvent> {
         let mut events = Vec::new();
 
-        if let Some(launcher_hotkey) = self.launcher_hotkey {
-            while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-                if event.id() == launcher_hotkey.id() && event.state() == HotKeyState::Pressed {
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.state() == HotKeyState::Pressed {
+                if self
+                    .launcher_hotkey
+                    .is_some_and(|hotkey| event.id() == hotkey.id())
+                {
                     events.push(IntegrationEvent::ToggleLauncher);
+                } else if self
+                    .quick_look_hotkey
+                    .is_some_and(|hotkey| event.id() == hotkey.id())
+                {
+                    events.push(IntegrationEvent::ToggleQuickLook);
                 }
             }
         }
@@ -178,6 +233,10 @@ impl DesktopIntegrations {
             item.set_checked(enabled);
         }
     }
+}
+
+fn quick_look_hotkey() -> HotKey {
+    HotKey::new(Some(GlobalHotKeyModifiers::SUPER), Code::KeyY)
 }
 
 fn create_tray_icon(
@@ -237,5 +296,12 @@ mod tests {
     fn launcher_hotkey_is_option_space() {
         let hotkey = ShortcutBinding::default().to_hotkey();
         assert_eq!(hotkey, ShortcutBinding::DEFAULT.to_hotkey());
+    }
+
+    #[test]
+    fn quick_look_hotkey_is_command_y() {
+        let hotkey = quick_look_hotkey();
+        assert_eq!(hotkey.mods, GlobalHotKeyModifiers::SUPER);
+        assert_eq!(hotkey.key, Code::KeyY);
     }
 }
