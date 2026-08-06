@@ -13,19 +13,19 @@ reproducible Cloudflare R2 delivery path.
 ## What works
 
 - Native Iced UI with no webview or JavaScript runtime
-- Application discovery in standard macOS application folders, including
-  user-facing CoreServices apps such as Finder and Keychain Access
+- Application discovery from standard macOS folders plus indexed non-standard
+  locations through Spotlight, with direct-scan fallback when Spotlight is unavailable
 - Installed application icons decoded directly from each macOS app bundle
 - Case-insensitive prefix, substring, and subsequence search
 - Pinned and frecency-based ranking
-- Inline calculator results, explicit `=` calculator mode, and a DuckDuckGo web-search fallback
+- Inline calculator results, explicit `=` calculator mode, and a Google web-search fallback
 - User-managed HTTP/HTTPS Quick Links
 - Spotlight file and folder results within the current user's home directory
 - Opt-in, local, text-only Clipboard History
 - Typed macOS system commands with confirmation for destructive actions
 - Configurable global launcher shortcut (`Option+Space` by default)
 - Menu bar controls for showing, launching at login, and quitting
-- In-app settings for the shortcut and launch-at-login behavior
+- In-app settings for the shortcut, launch-at-login behavior, and web-search engine
 - Selectable search input source with automatic restoration when the launcher hides
 - Automatic application rediscovery every 15 seconds
 - Context-aware keyboard actions for opening, copying, revealing in Finder,
@@ -117,9 +117,10 @@ version, without modifying the project interpreter environment.
 | `Return` / `Escape` on a confirmation screen | Confirm or cancel the reviewed action |
 | `Escape` | Close Quick Look first; otherwise leave Clipboard History, hide, or go back |
 
-DuckGooKey automatically rescans installed applications every 15 seconds. Use
-**Refresh Applications** from the result list or **Scan now** in Settings when
-you want an immediate refresh.
+DuckGooKey automatically rescans installed applications every 15 seconds. The
+direct scan remains available when Spotlight is disabled or not fully indexed.
+Use **Refresh Applications** from the result list or **Scan now** in Settings
+when you want an immediate refresh.
 
 ## Search and commands
 
@@ -136,8 +137,9 @@ Prefix a calculation with `=` to explicitly use the full calculator grammar:
 
 The result appears as a non-pinnable action. Press `Return` or `Command+C` to
 copy it. Any non-empty query in the main launcher can also produce a
-**Search DuckDuckGo for ...** fallback; opening it sends the URL-encoded query
-to DuckDuckGo in the default browser.
+**Search Google for ...** fallback; opening it sends the URL-encoded query to
+Google in the default browser. In **Settings**, choose Google or DuckDuckGo;
+Google is the default, including for existing settings files.
 
 ### Quick Links
 
@@ -151,10 +153,18 @@ requires confirmation.
 
 When the main search contains at least two characters, DuckGooKey also shows
 Spotlight-backed file and folder results from the current user's home directory,
-without building a second on-disk index. App and command results appear first,
-followed by matching files and folders with their Finder icons. `Return` opens a
-file, `Command+Return` reveals and selects it in Finder, and `Command+C` copies
-its absolute path.
+without building a second on-disk index. An explicit path (`~/…`, `/…`, or an
+existing home-relative `folder/file`) is resolved directly and promoted ahead of
+app results; an explicitly typed absolute path may point outside the home
+folder. End a directory path with `/` to list its immediate children, with
+folders first. When an existing home-relative path is only approximate, each
+folder-name component can use prefix, token, substring, or subsequence matching
+to find a likely path. Ordinary queries use Spotlight's filename index first.
+When fewer than four filename matches are available, content matches supplement
+the list below them. Apps and files are then combined by exact, prefix, token,
+substring, and subsequence relevance; an exact file can beat a weak app fuzzy
+match, while an exact app wins ties. `Return` opens a file, `Command+Return`
+reveals and selects it in Finder, and `Command+C` copies its absolute path.
 
 ### System commands
 

@@ -27,6 +27,20 @@ pub use macos::{
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileSearchMatchKind {
+    DirectPath,
+    FuzzyPath,
+    FileName,
+    Content,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileSearchResult {
+    pub path: PathBuf,
+    pub match_kind: FileSearchMatchKind,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputSource {
     pub identifier: String,

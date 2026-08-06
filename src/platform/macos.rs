@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashSet};
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStringExt;
@@ -29,7 +29,9 @@ use crate::START_HIDDEN_ARGUMENT;
 use crate::catalog::{CatalogItem, LaunchAction};
 use crate::commands::SystemCommand;
 
-use super::{ClipboardSnapshot, InputSource, PlatformError, Result};
+use super::{
+    ClipboardSnapshot, FileSearchMatchKind, FileSearchResult, InputSource, PlatformError, Result,
+};
 
 const OPEN_EXECUTABLE: &str = "/usr/bin/open";
 const MDFIND_EXECUTABLE: &str = "/usr/bin/mdfind";
@@ -39,6 +41,13 @@ const QLMANAGE_EXECUTABLE: &str = "/usr/bin/qlmanage";
 const LAUNCH_AGENT_LABEL: &str = "com.duckgoo.key";
 const LAUNCH_AGENT_FILE_NAME: &str = "com.duckgoo.key.plist";
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTENT_FALLBACK_RESULT_TARGET: usize = 4;
+const MAX_DIRECT_PATH_CHILDREN: usize = 512;
+const MAX_FUZZY_PATH_CANDIDATES: usize = 12;
+const APPLICATION_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SPOTLIGHT_APPLICATIONS: usize = 2_048;
+const SPOTLIGHT_APPLICATION_QUERY: &str =
+    "kMDItemContentTypeTree == 'com.apple.application-bundle'";
 const MAX_FILE_ICON_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED_PASTEBOARD_TYPES: [&str; 8] = [
     "org.nspasteboard.TransientType",
@@ -50,6 +59,12 @@ const IGNORED_PASTEBOARD_TYPES: [&str; 8] = [
     "de.petermaurer.TransientPasteboardType",
     "Pasteboard generator type",
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PathQuery {
+    resolved: PathBuf,
+    trailing_separator: bool,
+}
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUICK_LOOK_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
@@ -91,9 +106,17 @@ unsafe extern "C" {
 
 pub fn discover_applications() -> Result<Vec<CatalogItem>> {
     let home_directory = UserDirs::new().map(|directories| directories.home_dir().to_owned());
-    Ok(discover_in_roots(&application_roots(
-        home_directory.as_deref(),
-    )))
+    let direct_paths =
+        discover_application_paths_in_roots(&application_roots(home_directory.as_deref()));
+    let spotlight_paths = match discover_spotlight_application_paths() {
+        Ok(paths) => Some(paths),
+        Err(error) => {
+            tracing::warn!(error = %error, "Spotlight application discovery failed; using direct scan results");
+            None
+        }
+    };
+
+    Ok(merge_application_catalog(direct_paths, spotlight_paths))
 }
 
 fn application_roots(home_directory: Option<&Path>) -> Vec<PathBuf> {
@@ -262,21 +285,359 @@ fn system_command_spec(command: &SystemCommand) -> SystemCommandSpec {
     }
 }
 
-pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
+pub fn search_files(query: &str, limit: usize) -> Result<Vec<FileSearchResult>> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let query = mdfind_name_query(query);
 
     let user_directories = UserDirs::new().ok_or(PlatformError::HomeDirectoryUnavailable)?;
     let home_directory = user_directories.home_dir();
-    let mut child = Command::new(MDFIND_EXECUTABLE)
-        .arg("-0")
-        .arg("-onlyin")
-        .arg(home_directory)
-        .arg("-name")
-        .arg(query.as_ref())
+    if let Some(path_query) = parse_path_query(query, home_directory) {
+        let direct = direct_path_results(&path_query, limit);
+        if direct.len() == limit {
+            return Ok(direct);
+        }
+        let fuzzy = if direct.is_empty() {
+            fuzzy_path_results(&path_query, home_directory, limit)
+        } else {
+            Vec::new()
+        };
+        let path_results = merge_unique_path_results(direct, fuzzy, limit);
+        if path_results.len() == limit {
+            return Ok(path_results);
+        }
+
+        let mut command = file_search_command(home_directory);
+        command.arg(mdfind_path_query(&path_query));
+        let mut paths = run_file_search(command, limit)?;
+        prioritize_path_results(&mut paths, &path_query);
+        let spotlight = paths
+            .into_iter()
+            .map(|path| FileSearchResult {
+                path,
+                match_kind: FileSearchMatchKind::FileName,
+            })
+            .collect();
+        return Ok(merge_unique_path_results(path_results, spotlight, limit));
+    }
+
+    let mut command = file_search_command(home_directory);
+    command.arg("-name").arg(mdfind_name_query(query).as_ref());
+    let mut paths = run_file_search(command, limit)?;
+    prioritize_file_name_results(&mut paths, query);
+    let mut results = paths
+        .into_iter()
+        .map(|path| FileSearchResult {
+            path,
+            match_kind: FileSearchMatchKind::FileName,
+        })
+        .collect::<Vec<_>>();
+
+    // Content is a fallback only: it can broaden recall without displacing
+    // deterministic filename and path matches.
+    let fallback_target = limit.min(CONTENT_FALLBACK_RESULT_TARGET);
+    if results.len() < fallback_target {
+        let mut command = file_search_command(home_directory);
+        command
+            .arg("-interpret")
+            .arg(mdfind_name_query(query).as_ref());
+        let seen_paths = results
+            .iter()
+            .map(|result| result.path.clone())
+            .collect::<HashSet<_>>();
+        let content_limit = fallback_target.saturating_sub(results.len());
+        results.extend(
+            run_file_search(command, fallback_target)?
+                .into_iter()
+                .filter(|path| !seen_paths.contains(path))
+                .take(content_limit)
+                .map(|path| FileSearchResult {
+                    path,
+                    match_kind: FileSearchMatchKind::Content,
+                }),
+        );
+    }
+
+    Ok(results)
+}
+
+fn parse_path_query(query: &str, home_directory: &Path) -> Option<PathQuery> {
+    let query = query.trim();
+    if query.is_empty() || query.contains("://") || is_numeric_fraction_query(query) {
+        return None;
+    }
+    let trailing_separator = query.ends_with('/');
+    let resolved = if query.starts_with('/') {
+        normalize_absolute_path(Path::new(query))?
+    } else if let Some(relative) = query.strip_prefix("~/") {
+        normalize_home_relative_path(relative, home_directory)?
+    } else {
+        if !query.contains('/') {
+            return None;
+        }
+        let resolved = normalize_home_relative_path(query, home_directory)?;
+        if !resolved.exists() && !resolved.parent().is_some_and(Path::is_dir) {
+            return None;
+        }
+        resolved
+    };
+
+    Some(PathQuery {
+        resolved,
+        trailing_separator,
+    })
+}
+
+fn is_numeric_fraction_query(query: &str) -> bool {
+    let mut operands = query.split('/');
+    let Some(left) = operands.next() else {
+        return false;
+    };
+    let Some(right) = operands.next() else {
+        return false;
+    };
+    operands.next().is_none()
+        && left.trim().parse::<f64>().is_ok()
+        && right.trim().parse::<f64>().is_ok()
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(component) => normalized.push(component),
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn normalize_home_relative_path(path: &str, home_directory: &Path) -> Option<PathBuf> {
+    let mut normalized = home_directory.to_path_buf();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized == home_directory {
+                    return None;
+                }
+                normalized.pop();
+            }
+            Component::Normal(component) => normalized.push(component),
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn direct_path_results(path_query: &PathQuery, limit: usize) -> Vec<FileSearchResult> {
+    if !path_query.resolved.exists() || limit == 0 {
+        return Vec::new();
+    }
+    if !path_query.trailing_separator || !path_query.resolved.is_dir() {
+        return vec![FileSearchResult {
+            path: path_query.resolved.clone(),
+            match_kind: FileSearchMatchKind::DirectPath,
+        }];
+    }
+
+    let entries = match fs::read_dir(&path_query.resolved) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(path = %path_query.resolved.display(), error = %error, "Could not read direct path children");
+            return vec![FileSearchResult {
+                path: path_query.resolved.clone(),
+                match_kind: FileSearchMatchKind::DirectPath,
+            }];
+        }
+    };
+    let mut children = entries
+        .take(MAX_DIRECT_PATH_CHILDREN)
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        right
+            .is_dir()
+            .cmp(&left.is_dir())
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+    children.truncate(limit);
+    children
+        .into_iter()
+        .map(|path| FileSearchResult {
+            path,
+            match_kind: FileSearchMatchKind::DirectPath,
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct FuzzyPathCandidate {
+    path: PathBuf,
+    score: u16,
+}
+
+fn fuzzy_path_results(
+    path_query: &PathQuery,
+    home_directory: &Path,
+    limit: usize,
+) -> Vec<FileSearchResult> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(relative_path) = path_query.resolved.strip_prefix(home_directory) else {
+        return Vec::new();
+    };
+    let components = relative_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(component) => Some(component.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![FuzzyPathCandidate {
+        path: home_directory.to_path_buf(),
+        score: 0,
+    }];
+    for (index, component) in components.iter().enumerate() {
+        let is_last = index + 1 == components.len();
+        let mut next = Vec::new();
+        for candidate in candidates {
+            let exact = candidate.path.join(component);
+            if exact.exists() && (is_last || exact.is_dir()) {
+                next.push(FuzzyPathCandidate {
+                    path: exact,
+                    score: candidate.score,
+                });
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&candidate.path) else {
+                continue;
+            };
+            for entry in entries.take(MAX_DIRECT_PATH_CHILDREN).flatten() {
+                let path = entry.path();
+                if !is_last && !path.is_dir() {
+                    continue;
+                }
+                let Some(rank) = fuzzy_path_component_rank(&path, component) else {
+                    continue;
+                };
+                next.push(FuzzyPathCandidate {
+                    path,
+                    score: candidate.score + u16::from(rank),
+                });
+            }
+        }
+        deduplicate_and_limit_fuzzy_path_candidates(&mut next);
+        if next.is_empty() {
+            return Vec::new();
+        }
+        candidates = next;
+    }
+
+    if path_query.trailing_separator {
+        let mut results = Vec::new();
+        for candidate in candidates {
+            let children = direct_path_results(
+                &PathQuery {
+                    resolved: candidate.path,
+                    trailing_separator: true,
+                },
+                limit.saturating_sub(results.len()),
+            );
+            results.extend(children.into_iter().map(|result| FileSearchResult {
+                path: result.path,
+                match_kind: FileSearchMatchKind::FuzzyPath,
+            }));
+            if results.len() == limit {
+                break;
+            }
+        }
+        return results;
+    }
+
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| FileSearchResult {
+            path: candidate.path,
+            match_kind: FileSearchMatchKind::FuzzyPath,
+        })
+        .collect()
+}
+
+fn fuzzy_path_component_rank(path: &Path, query: &OsStr) -> Option<u8> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let query = query.to_string_lossy().to_lowercase();
+    let query = query.as_str();
+    let length_delta = name.chars().count().saturating_sub(query.chars().count());
+    if name == query {
+        Some(0)
+    } else if name.starts_with(query) {
+        Some(1 + u8::try_from(length_delta.min(8)).unwrap_or(8))
+    } else if name
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(query))
+    {
+        Some(10 + u8::try_from(length_delta.min(8)).unwrap_or(8))
+    } else if name.contains(query) {
+        Some(20 + u8::try_from(length_delta.min(8)).unwrap_or(8))
+    } else if is_subsequence(query, &name) {
+        Some(30 + u8::try_from(length_delta.min(8)).unwrap_or(8))
+    } else {
+        None
+    }
+}
+
+fn deduplicate_and_limit_fuzzy_path_candidates(candidates: &mut Vec<FuzzyPathCandidate>) {
+    candidates.sort_by(|left, right| {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| seen.insert(path_dedupe_key(&candidate.path)));
+    candidates.truncate(MAX_FUZZY_PATH_CANDIDATES);
+}
+
+fn merge_unique_path_results(
+    direct: Vec<FileSearchResult>,
+    spotlight: Vec<FileSearchResult>,
+    limit: usize,
+) -> Vec<FileSearchResult> {
+    let mut seen = HashSet::new();
+    direct
+        .into_iter()
+        .chain(spotlight)
+        .filter(|result| seen.insert(path_dedupe_key(&result.path)))
+        .take(limit)
+        .collect()
+}
+
+fn path_dedupe_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn file_search_command(home_directory: &Path) -> Command {
+    let mut command = Command::new(MDFIND_EXECUTABLE);
+    command.arg("-0").arg("-onlyin").arg(home_directory);
+    command
+}
+
+fn run_file_search(mut command: Command, limit: usize) -> Result<Vec<PathBuf>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -285,12 +646,48 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
             path: PathBuf::from(MDFIND_EXECUTABLE),
             source,
         })?;
+    let paths = read_spotlight_paths(&mut child, limit, FILE_SEARCH_TIMEOUT, "file search")?;
+    finish_spotlight_search(&mut child, paths, limit)
+}
 
+fn discover_spotlight_application_paths() -> Result<Vec<PathBuf>> {
+    let mut child = Command::new(MDFIND_EXECUTABLE)
+        .arg("-0")
+        .arg(SPOTLIGHT_APPLICATION_QUERY)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| PlatformError::Io {
+            operation: "starting Spotlight application discovery",
+            path: PathBuf::from(MDFIND_EXECUTABLE),
+            source,
+        })?;
+
+    let paths = read_spotlight_paths(
+        &mut child,
+        MAX_SPOTLIGHT_APPLICATIONS,
+        APPLICATION_SEARCH_TIMEOUT,
+        "application discovery",
+    )?;
+    let paths = finish_spotlight_search(&mut child, paths, MAX_SPOTLIGHT_APPLICATIONS)?;
+
+    Ok(paths
+        .into_iter()
+        .filter(|path| is_spotlight_launchable_application(path))
+        .collect())
+}
+
+fn read_spotlight_paths(
+    child: &mut Child,
+    limit: usize,
+    timeout: Duration,
+    operation: &'static str,
+) -> Result<Vec<PathBuf>> {
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return Err(PlatformError::Io {
-            operation: "reading Spotlight file search results",
+            operation: "reading Spotlight results",
             path: PathBuf::from(MDFIND_EXECUTABLE),
             source: io::Error::new(io::ErrorKind::BrokenPipe, "mdfind stdout was unavailable"),
         });
@@ -299,14 +696,14 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
     let reader = thread::spawn(move || {
         let _ = sender.send(read_nul_separated_paths(BufReader::new(stdout), limit));
     });
-    let paths = match receiver.recv_timeout(FILE_SEARCH_TIMEOUT) {
+    let paths = match receiver.recv_timeout(timeout) {
         Ok(Ok(paths)) => paths,
         Ok(Err(source)) => {
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
             return Err(PlatformError::Io {
-                operation: "reading Spotlight file search results",
+                operation: "reading Spotlight results",
                 path: PathBuf::from(MDFIND_EXECUTABLE),
                 source,
             });
@@ -317,7 +714,7 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
             let _ = reader.join();
             return Err(PlatformError::CommandTimedOut {
                 executable: MDFIND_EXECUTABLE,
-                timeout_ms: u64::try_from(FILE_SEARCH_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
             });
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -325,14 +722,24 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
             let _ = child.wait();
             let _ = reader.join();
             return Err(PlatformError::Io {
-                operation: "reading Spotlight file search results",
+                operation: "reading Spotlight results",
                 path: PathBuf::from(MDFIND_EXECUTABLE),
-                source: io::Error::other("Spotlight result reader stopped unexpectedly"),
+                source: io::Error::other(format!(
+                    "Spotlight {operation} result reader stopped unexpectedly"
+                )),
             });
         }
     };
     let _ = reader.join();
 
+    Ok(paths)
+}
+
+fn finish_spotlight_search(
+    child: &mut Child,
+    paths: Vec<PathBuf>,
+    limit: usize,
+) -> Result<Vec<PathBuf>> {
     if paths.len() == limit {
         // `mdfind` has no result-limit flag. Stop it as soon as enough paths
         // have been read so a broad query cannot grow memory without bound.
@@ -342,7 +749,7 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
     }
 
     let status = child.wait().map_err(|source| PlatformError::Io {
-        operation: "waiting for Spotlight file search",
+        operation: "waiting for Spotlight search",
         path: PathBuf::from(MDFIND_EXECUTABLE),
         source,
     })?;
@@ -488,6 +895,87 @@ fn mdfind_name_query(query: &str) -> Cow<'_, str> {
         Cow::Owned(format!("*{query}"))
     } else {
         Cow::Borrowed(query)
+    }
+}
+
+fn mdfind_path_query(path_query: &PathQuery) -> String {
+    let fragment = path_query
+        .resolved
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!(r#"kMDItemPath == "*{fragment}*"cd"#)
+}
+
+fn prioritize_path_results(paths: &mut [PathBuf], path_query: &PathQuery) {
+    let fragment = path_query.resolved.to_string_lossy().to_lowercase();
+    paths.sort_by(|left, right| {
+        path_match_rank(left, &fragment)
+            .cmp(&path_match_rank(right, &fragment))
+            .then_with(|| left.to_string_lossy().cmp(&right.to_string_lossy()))
+    });
+}
+
+fn prioritize_file_name_results(paths: &mut [PathBuf], query: &str) {
+    let query = query.to_lowercase();
+    paths.sort_by(|left, right| {
+        file_name_match_rank(left, &query).cmp(&file_name_match_rank(right, &query))
+    });
+}
+
+fn file_name_match_rank(path: &Path, query: &str) -> (u8, usize) {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .to_lowercase();
+    let length_delta = name.chars().count().saturating_sub(query.chars().count());
+
+    if name == query {
+        (0, length_delta)
+    } else if name.starts_with(query) {
+        (1, length_delta)
+    } else if name
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(query))
+    {
+        (2, length_delta)
+    } else if name.contains(query) {
+        (3, length_delta)
+    } else if is_subsequence(query, &name) {
+        (4, length_delta)
+    } else {
+        // Keep Spotlight's original ordering for content-only matches.
+        (5, length_delta)
+    }
+}
+
+fn is_subsequence(query: &str, candidate: &str) -> bool {
+    let mut query = query.chars();
+    let Some(mut expected) = query.next() else {
+        return true;
+    };
+
+    for character in candidate.chars() {
+        if character == expected {
+            let Some(next) = query.next() else {
+                return true;
+            };
+            expected = next;
+        }
+    }
+
+    false
+}
+
+fn path_match_rank(path: &Path, fragment: &str) -> u8 {
+    let path = path.to_string_lossy().to_lowercase();
+    if path == fragment {
+        0
+    } else if path.starts_with(fragment) {
+        1
+    } else {
+        2
     }
 }
 
@@ -748,7 +1236,12 @@ fn localized_name_order(left: &InputSource, right: &InputSource) -> CmpOrdering 
         .then_with(|| left.identifier.cmp(&right.identifier))
 }
 
+#[cfg(test)]
 fn discover_in_roots(roots: &[PathBuf]) -> Vec<CatalogItem> {
+    catalog_items_from_application_paths(discover_application_paths_in_roots(roots))
+}
+
+fn discover_application_paths_in_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut applications = Vec::new();
     let mut seen_paths = HashSet::new();
 
@@ -778,7 +1271,26 @@ fn discover_in_roots(roots: &[PathBuf]) -> Vec<CatalogItem> {
                 continue;
             }
 
-            applications.push(catalog_item_from_bundle(path));
+            applications.push(path.to_owned());
+        }
+    }
+
+    applications
+}
+
+fn catalog_items_from_application_paths(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Vec<CatalogItem> {
+    let mut applications = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    for path in paths {
+        if !path.is_dir() || !is_application_bundle(&path) {
+            continue;
+        }
+        let normalized_path = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if seen_paths.insert(normalized_path) {
+            applications.push(catalog_item_from_bundle(&path));
         }
     }
 
@@ -791,10 +1303,47 @@ fn discover_in_roots(roots: &[PathBuf]) -> Vec<CatalogItem> {
     applications
 }
 
+fn merge_application_catalog(
+    direct_paths: Vec<PathBuf>,
+    spotlight_paths: Option<Vec<PathBuf>>,
+) -> Vec<CatalogItem> {
+    catalog_items_from_application_paths(
+        direct_paths
+            .into_iter()
+            .chain(spotlight_paths.into_iter().flatten()),
+    )
+}
+
 fn is_application_bundle(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+}
+
+fn is_spotlight_launchable_application(path: &Path) -> bool {
+    if !path.is_dir() || !is_application_bundle(path) || is_nested_application_bundle(path) {
+        return false;
+    }
+
+    let Some(dictionary) = application_info_dictionary(path) else {
+        return false;
+    };
+    if dictionary
+        .get("LSBackgroundOnly")
+        .and_then(Value::as_boolean)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    dictionary
+        .get("CFBundlePackageType")
+        .and_then(Value::as_string)
+        .is_none_or(|package_type| package_type.eq_ignore_ascii_case("APPL"))
+}
+
+fn is_nested_application_bundle(path: &Path) -> bool {
+    path.ancestors().skip(1).any(is_application_bundle)
 }
 
 fn catalog_item_from_bundle(bundle_path: &Path) -> CatalogItem {
@@ -804,25 +1353,7 @@ fn catalog_item_from_bundle(bundle_path: &Path) -> CatalogItem {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("Application")
         .to_owned();
-    let info_path = bundle_path.join("Contents/Info.plist");
-    let dictionary = match Value::from_file(&info_path) {
-        Ok(Value::Dictionary(dictionary)) => Some(dictionary),
-        Ok(_) => {
-            tracing::debug!(
-                path = %info_path.display(),
-                "Application Info.plist was not a dictionary"
-            );
-            None
-        }
-        Err(error) => {
-            tracing::debug!(
-                path = %info_path.display(),
-                error = %error,
-                "Using the bundle name because Info.plist could not be read"
-            );
-            None
-        }
-    };
+    let dictionary = application_info_dictionary(bundle_path);
 
     let display_name = dictionary
         .as_ref()
@@ -851,6 +1382,28 @@ fn catalog_item_from_bundle(bundle_path: &Path) -> CatalogItem {
         }
     }
     item
+}
+
+fn application_info_dictionary(bundle_path: &Path) -> Option<Dictionary> {
+    let info_path = bundle_path.join("Contents/Info.plist");
+    match Value::from_file(&info_path) {
+        Ok(Value::Dictionary(dictionary)) => Some(dictionary),
+        Ok(_) => {
+            tracing::debug!(
+                path = %info_path.display(),
+                "Application Info.plist was not a dictionary"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(
+                path = %info_path.display(),
+                error = %error,
+                "Application Info.plist could not be read"
+            );
+            None
+        }
+    }
 }
 
 fn application_icon_path(bundle_path: &Path, dictionary: Option<&Dictionary>) -> Option<PathBuf> {
@@ -1210,6 +1763,61 @@ mod tests {
     }
 
     #[test]
+    fn spotlight_discovery_rejects_nested_background_and_non_application_bundles() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("Spotlight.app");
+        let nested = application.join("Contents/Helpers/Nested.app");
+        let background = directory.path().join("Background.app");
+        let package = directory.path().join("Package.app");
+
+        write_bundle(&application, None, "Spotlight");
+        write_bundle(&nested, None, "Nested");
+        write_bundle(&background, None, "Background");
+        update_bundle_info(&background, |dictionary| {
+            dictionary.insert("LSBackgroundOnly".to_owned(), Value::Boolean(true));
+        });
+        write_bundle(&package, None, "Package");
+        update_bundle_info(&package, |dictionary| {
+            dictionary.insert(
+                "CFBundlePackageType".to_owned(),
+                Value::String("FMWK".to_owned()),
+            );
+        });
+
+        assert!(is_spotlight_launchable_application(&application));
+        assert!(!is_spotlight_launchable_application(&nested));
+        assert!(!is_spotlight_launchable_application(&background));
+        assert!(!is_spotlight_launchable_application(&package));
+    }
+
+    #[test]
+    fn merged_application_paths_deduplicate_canonical_bundle_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("Applications/Example.app");
+        let alias = directory.path().join("Elsewhere/Example.app");
+        write_bundle(&application, None, "Example");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&application, &alias).unwrap();
+
+        let items = merge_application_catalog(vec![application.clone()], Some(vec![alias]));
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action.target(), Some(application.as_path()));
+    }
+
+    #[test]
+    fn direct_application_results_survive_a_spotlight_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("Applications/Direct.app");
+        write_bundle(&application, None, "Direct");
+
+        let items = merge_application_catalog(vec![application.clone()], None);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action.target(), Some(application.as_path()));
+    }
+
+    #[test]
     fn discovery_resolves_bundle_icon_file_with_an_omitted_extension() {
         let directory = tempfile::tempdir().unwrap();
         let bundle = directory.path().join("Example.app");
@@ -1373,8 +1981,14 @@ mod tests {
 
     #[test]
     fn empty_spotlight_searches_do_not_start_a_process() {
-        assert_eq!(search_files("   ", 10).unwrap(), Vec::<PathBuf>::new());
-        assert_eq!(search_files("example", 0).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            search_files("   ", 10).unwrap(),
+            Vec::<FileSearchResult>::new()
+        );
+        assert_eq!(
+            search_files("example", 0).unwrap(),
+            Vec::<FileSearchResult>::new()
+        );
     }
 
     #[test]
@@ -1382,6 +1996,209 @@ mod tests {
         assert_eq!(mdfind_name_query("notes"), "notes");
         assert_eq!(mdfind_name_query("-notes"), "*-notes");
         assert_eq!(mdfind_name_query("--help"), "*--help");
+    }
+
+    #[test]
+    fn file_name_results_prioritize_exact_prefix_token_and_fuzzy_matches() {
+        let mut paths = vec![
+            PathBuf::from("/tmp/q1u2a3r4t5e6r7l8y"),
+            PathBuf::from("/tmp/annual_report.pdf"),
+            PathBuf::from("/tmp/report-archive.pdf"),
+            PathBuf::from("/tmp/report"),
+        ];
+
+        prioritize_file_name_results(&mut paths, "report");
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/report"),
+                PathBuf::from("/tmp/report-archive.pdf"),
+                PathBuf::from("/tmp/annual_report.pdf"),
+                PathBuf::from("/tmp/q1u2a3r4t5e6r7l8y"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_query_expands_home_and_escapes_spotlight_string_literals() {
+        let home = Path::new("/Users/example");
+        let quoted = parse_path_query("~/Documents/\"draft\".md", home).unwrap();
+
+        assert_eq!(
+            mdfind_path_query(&quoted),
+            r#"kMDItemPath == "*/Users/example/Documents/\"draft\".md*"cd"#
+        );
+    }
+
+    #[test]
+    fn path_results_prefer_exact_and_prefix_matches() {
+        let home = Path::new("/Users/example");
+        let path_query = parse_path_query("~/Documents/report.pdf", home).unwrap();
+        let mut paths = vec![
+            PathBuf::from("/Users/example/Archive/Documents/report.pdf"),
+            PathBuf::from("/Users/example/Documents/report.pdf.backup"),
+            PathBuf::from("/Users/example/Documents/report.pdf"),
+        ];
+
+        prioritize_path_results(&mut paths, &path_query);
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/Users/example/Documents/report.pdf"),
+                PathBuf::from("/Users/example/Documents/report.pdf.backup"),
+                PathBuf::from("/Users/example/Archive/Documents/report.pdf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_query_recognizes_home_absolute_and_existing_home_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        fs::create_dir(home.join("Documents")).unwrap();
+
+        assert_eq!(
+            parse_path_query("~/Documents", home).unwrap().resolved,
+            home.join("Documents")
+        );
+        assert_eq!(
+            parse_path_query("Documents/report", home).unwrap().resolved,
+            home.join("Documents/report")
+        );
+        assert_eq!(
+            parse_path_query("/Volumes/Drive/Projects", home)
+                .unwrap()
+                .resolved,
+            PathBuf::from("/Volumes/Drive/Projects")
+        );
+    }
+
+    #[test]
+    fn path_query_rejects_urls_and_calculation_like_slashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        fs::create_dir(home.join("1")).unwrap();
+
+        assert!(parse_path_query("https://example.com/a", home).is_none());
+        assert!(parse_path_query("http://example.com/a", home).is_none());
+        assert!(parse_path_query("1/2", home).is_none());
+        assert!(parse_path_query("12 / 3", home).is_none());
+    }
+
+    #[test]
+    fn direct_path_results_return_exact_paths_and_trailing_folder_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let folder = root.join("Folder");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(folder.join("Alpha")).unwrap();
+        fs::write(folder.join("zeta.txt"), b"file").unwrap();
+
+        let exact = PathQuery {
+            resolved: folder.clone(),
+            trailing_separator: false,
+        };
+        assert_eq!(
+            direct_path_results(&exact, 5),
+            vec![FileSearchResult {
+                path: folder.clone(),
+                match_kind: FileSearchMatchKind::DirectPath,
+            }]
+        );
+
+        let children = PathQuery {
+            resolved: folder,
+            trailing_separator: true,
+        };
+        let children = direct_path_results(&children, 5);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].path.file_name().unwrap(), "Alpha");
+        assert_eq!(children[1].path.file_name().unwrap(), "zeta.txt");
+        assert!(
+            children
+                .iter()
+                .all(|result| result.match_kind == FileSearchMatchKind::DirectPath)
+        );
+    }
+
+    #[test]
+    fn fuzzy_path_results_resolve_folder_name_prefixes_per_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let applications = home.join("Documents/resumes/applications");
+        fs::create_dir_all(&applications).unwrap();
+
+        let results = fuzzy_path_results(
+            &PathQuery {
+                resolved: home.join("Documents/resumes/application"),
+                trailing_separator: false,
+            },
+            home,
+            5,
+        );
+
+        assert_eq!(
+            results,
+            vec![FileSearchResult {
+                path: applications,
+                match_kind: FileSearchMatchKind::FuzzyPath,
+            }]
+        );
+    }
+
+    #[test]
+    fn fuzzy_path_results_can_correct_an_intermediate_folder_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let applications = home.join("Documents/resumes/applications");
+        fs::create_dir_all(&applications).unwrap();
+
+        let results = fuzzy_path_results(
+            &PathQuery {
+                resolved: home.join("Documents/resum/application"),
+                trailing_separator: false,
+            },
+            home,
+            5,
+        );
+
+        assert_eq!(results[0].path, applications);
+        assert_eq!(results[0].match_kind, FileSearchMatchKind::FuzzyPath);
+    }
+
+    #[test]
+    fn direct_path_results_deduplicate_spotlight_candidates() {
+        let direct = FileSearchResult {
+            path: PathBuf::from("/tmp/direct"),
+            match_kind: FileSearchMatchKind::DirectPath,
+        };
+        let merged = merge_unique_path_results(
+            vec![direct.clone()],
+            vec![
+                FileSearchResult {
+                    path: PathBuf::from("/tmp/direct"),
+                    match_kind: FileSearchMatchKind::FileName,
+                },
+                FileSearchResult {
+                    path: PathBuf::from("/tmp/spotlight"),
+                    match_kind: FileSearchMatchKind::FileName,
+                },
+            ],
+            5,
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                direct,
+                FileSearchResult {
+                    path: PathBuf::from("/tmp/spotlight"),
+                    match_kind: FileSearchMatchKind::FileName,
+                }
+            ]
+        );
     }
 
     #[test]

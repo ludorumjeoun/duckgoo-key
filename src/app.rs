@@ -17,14 +17,15 @@ use iced::{
 use crate::app_icon;
 use crate::calculator;
 use crate::catalog::{
-    Catalog, CatalogItem, LaunchAction, SearchMode, SearchResult, UsageRecord, current_unix_time_ms,
+    Catalog, CatalogItem, LaunchAction, MatchKind, SearchMode, SearchResult, UsageRecord,
+    current_unix_time_ms,
 };
 use crate::commands::{self, SystemCommand};
 use crate::integrations::{DesktopIntegrations, IntegrationEvent};
 use crate::platform;
 use crate::quick_link::QuickLink;
 use crate::shortcut::ShortcutBinding;
-use crate::store::{Store, StoreData};
+use crate::store::{SearchEngine, Store, StoreData};
 use crate::telemetry;
 use crate::updater;
 use crate::web_search;
@@ -37,7 +38,7 @@ const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(220);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FILE_RESULT_LIMIT: usize = 50;
-const ROOT_FILE_RESULT_LIMIT: usize = 2;
+const ROOT_FILE_RESULT_LIMIT: usize = 4;
 
 const TEXT_PRIMARY: Color = Color {
     r: 0.95,
@@ -115,9 +116,9 @@ struct Launcher {
     input_source_to_restore: Option<String>,
     file_search_revision: u64,
     file_search_pending: bool,
-    file_search_in_progress: bool,
+    file_search_active_revision: Option<u64>,
     file_query_changed_at: Instant,
-    file_results: Vec<CatalogItem>,
+    file_results: Vec<FileResult>,
     file_search_error: Option<String>,
     quick_look_path: Option<PathBuf>,
     clipboard_change_count: Option<i64>,
@@ -139,6 +140,30 @@ struct Launcher {
     store: Option<Store>,
     integrations: Option<DesktopIntegrations>,
     notice: Option<Notice>,
+}
+
+#[derive(Clone)]
+struct FileResult {
+    item: CatalogItem,
+    match_kind: platform::FileSearchMatchKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RootMatchTier {
+    Path,
+    Exact,
+    Prefix,
+    WordPrefix,
+    Substring,
+    Subsequence,
+    Content,
+}
+
+struct MergedRootResult {
+    result: SearchResult,
+    tier: RootMatchTier,
+    from_catalog: bool,
+    source_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +260,7 @@ enum Message {
     SetClipboardHistoryEnabled(bool),
     SetAnonymousUsageStatsEnabled(bool),
     SetUpdateChecksEnabled(bool),
+    SetSearchEngine(SearchEngine),
     CheckForUpdates,
     UpdateCheckTick,
     UpdateCheckFinished {
@@ -256,7 +282,7 @@ enum Message {
     FileSearchTick,
     FileSearchFinished {
         revision: u64,
-        result: Result<Vec<PathBuf>, String>,
+        result: Result<Vec<platform::FileSearchResult>, String>,
     },
     FileIconsLoaded {
         revision: u64,
@@ -358,7 +384,9 @@ fn boot() -> (Launcher, Task<Message>) {
         decorations: false,
         transparent: true,
         blur: false,
-        level: window::Level::AlwaysOnTop,
+        // The launcher is focused explicitly when shown, so it does not need
+        // to stay above other native macOS surfaces such as Quick Look.
+        level: window::Level::Normal,
         exit_on_close_request: false,
         ..window::Settings::default()
     };
@@ -395,7 +423,7 @@ fn boot() -> (Launcher, Task<Message>) {
         input_source_to_restore: None,
         file_search_revision: 0,
         file_search_pending: false,
-        file_search_in_progress: false,
+        file_search_active_revision: None,
         file_query_changed_at: Instant::now(),
         file_results: Vec::new(),
         file_search_error: None,
@@ -609,6 +637,10 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
             set_update_checks_enabled(state, enabled);
             Task::none()
         }
+        Message::SetSearchEngine(engine) => {
+            set_search_engine(state, engine);
+            Task::none()
+        }
         Message::CheckForUpdates => {
             if state.update_checking || state.update_installing {
                 Task::none()
@@ -737,27 +769,40 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         }
         Message::FileSearchTick => maybe_start_file_search(state),
         Message::FileSearchFinished { revision, result } => {
-            state.file_search_in_progress = false;
+            if state.file_search_active_revision == Some(revision) {
+                state.file_search_active_revision = None;
+            }
             if state.search_mode.is_none() && revision == state.file_search_revision {
                 match result {
-                    Ok(paths) => {
-                        state.file_results = paths
+                    Ok(results) => {
+                        state.file_results = results
                             .into_iter()
-                            .filter(|path| path.exists())
-                            .map(|path| {
-                                let title = path
+                            .filter(|result| result.path.exists())
+                            .map(|result| {
+                                let title = result
+                                    .path
                                     .file_name()
                                     .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                                let mut item = CatalogItem::path(path, title);
+                                    .unwrap_or_else(|| result.path.to_string_lossy().into_owned());
+                                let mut item = CatalogItem::path(result.path, title);
                                 item.pinnable = false;
-                                item
+                                FileResult {
+                                    item,
+                                    match_kind: result.match_kind,
+                                }
                             })
                             .collect();
                         state.file_search_error = None;
                         state.selected =
                             state.selected.min(state.results().len().saturating_sub(1));
-                        return load_file_icons(revision, state.file_results.clone());
+                        return load_file_icons(
+                            revision,
+                            state
+                                .file_results
+                                .iter()
+                                .map(|result| result.item.clone())
+                                .collect(),
+                        );
                     }
                     Err(error) => {
                         state.file_results.clear();
@@ -1601,6 +1646,22 @@ fn set_update_checks_enabled(state: &mut Launcher, enabled: bool) {
     }));
 }
 
+fn set_search_engine(state: &mut Launcher, engine: SearchEngine) {
+    if state.store_data.settings.search_engine == engine {
+        return;
+    }
+
+    let mut candidate = state.store_data.clone();
+    candidate.settings.search_engine = engine;
+    if save_candidate(state, &candidate).is_err() {
+        return;
+    }
+
+    state.store_data = candidate;
+    refresh_dynamic_results(state);
+    state.notice = Some(Notice::info(format!("Web searches will use {engine}")));
+}
+
 fn set_anonymous_usage_stats_enabled(state: &mut Launcher, enabled: bool) -> Task<Message> {
     if state.store_data.settings.anonymous_usage_stats_enabled == enabled {
         return Task::none();
@@ -1760,7 +1821,6 @@ fn exit_search_mode(state: &mut Launcher) -> Task<Message> {
 fn maybe_start_file_search(state: &mut Launcher) -> Task<Message> {
     if state.search_mode.is_some()
         || !state.file_search_pending
-        || state.file_search_in_progress
         || state.file_query_changed_at.elapsed() < FILE_SEARCH_DEBOUNCE
     {
         return Task::none();
@@ -1773,7 +1833,7 @@ fn maybe_start_file_search(state: &mut Launcher) -> Task<Message> {
     }
     let revision = state.file_search_revision;
     state.file_search_pending = false;
-    state.file_search_in_progress = true;
+    state.file_search_active_revision = Some(revision);
     Task::perform(
         async move {
             platform::search_files(&query, FILE_RESULT_LIMIT).map_err(|error| error.to_string())
@@ -1785,9 +1845,10 @@ fn maybe_start_file_search(state: &mut Launcher) -> Task<Message> {
 fn reset_file_search(state: &mut Launcher) {
     state.file_search_revision = state.file_search_revision.wrapping_add(1);
     state.file_search_pending = false;
+    state.file_search_active_revision = None;
     state.file_query_changed_at = Instant::now();
     for item in &state.file_results {
-        state.icon_handles.remove(&item.id);
+        state.icon_handles.remove(&item.item.id);
     }
     state.file_results.clear();
     state.file_search_error = None;
@@ -2279,7 +2340,7 @@ fn launcher_view(state: &Launcher) -> Element<'_, Message> {
         text("Indexing applications…")
             .size(11)
             .color(TEXT_SECONDARY)
-    } else if state.file_search_pending || state.file_search_in_progress {
+    } else if state.file_search_pending || state.file_search_active_revision.is_some() {
         text("Searching files…").size(11).color(TEXT_SECONDARY)
     } else if state.file_search_error.is_some() {
         text("File search unavailable").size(11).color(DANGER)
@@ -2490,6 +2551,35 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     .width(Fill)
     .style(settings_card_style);
 
+    let search_engine_picker = pick_list(
+        [SearchEngine::Google, SearchEngine::DuckDuckGo],
+        Some(state.store_data.settings.search_engine),
+        Message::SetSearchEngine,
+    )
+    .width(180)
+    .padding([8, 10])
+    .text_size(12)
+    .style(input_source_pick_list_style)
+    .menu_style(input_source_menu_style);
+    let search_engine_card = container(
+        iced::widget::row![
+            iced::widget::column![
+                text("Web search engine").size(14).color(TEXT_PRIMARY),
+                text("Used by the web-search result in the main launcher")
+                    .size(11)
+                    .color(TEXT_SECONDARY),
+            ]
+            .spacing(4)
+            .width(Fill),
+            search_engine_picker,
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center),
+    )
+    .padding(15)
+    .width(Fill)
+    .style(settings_card_style);
+
     let shortcut_button_label = if state.capturing_shortcut {
         "Press shortcut…"
     } else {
@@ -2638,6 +2728,7 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
         reset_shortcut,
         input_source_card,
         text("FEATURES").size(10).color(TEXT_SECONDARY),
+        search_engine_card,
         quick_links_card,
         clipboard_card,
         anonymous_usage_stats_card,
@@ -3041,25 +3132,63 @@ impl Launcher {
                 })
                 .collect(),
             None => {
-                let file_count = self.file_results.len().min(ROOT_FILE_RESULT_LIMIT);
-                let reserved = usize::from(self.calculator_result.is_some())
-                    + file_count
-                    + usize::from(self.web_search_result.is_some());
-                let mut results = self.catalog.search(
-                    &self.query,
-                    &self.store_data.usage,
-                    current_unix_time_ms(),
-                    RESULT_LIMIT.saturating_sub(reserved),
-                );
-                if let Some(item) = self.calculator_result.clone() {
-                    results.insert(0, dynamic_search_result(item));
-                }
-                results.extend(
+                let mut merged = self
+                    .catalog
+                    .search(
+                        &self.query,
+                        &self.store_data.usage,
+                        current_unix_time_ms(),
+                        RESULT_LIMIT,
+                    )
+                    .into_iter()
+                    .enumerate()
+                    .map(|(source_index, result)| MergedRootResult {
+                        tier: catalog_match_tier(&result, &self.query),
+                        result,
+                        from_catalog: true,
+                        source_index,
+                    })
+                    .collect::<Vec<_>>();
+                merged.extend(
                     self.file_results
                         .iter()
-                        .take(file_count)
-                        .cloned()
-                        .map(dynamic_search_result),
+                        .take(ROOT_FILE_RESULT_LIMIT)
+                        .enumerate()
+                        .map(|(source_index, file)| MergedRootResult {
+                            result: file_search_result(file),
+                            tier: file_match_tier(file, &self.query),
+                            from_catalog: false,
+                            source_index,
+                        }),
+                );
+                merged.sort_by(|left, right| {
+                    left.tier
+                        .cmp(&right.tier)
+                        .then_with(|| right.from_catalog.cmp(&left.from_catalog))
+                        .then_with(|| {
+                            right
+                                .result
+                                .match_score
+                                .cmp(&left.result.match_score)
+                                .then_with(|| right.result.pinned.cmp(&left.result.pinned))
+                                .then_with(|| {
+                                    right.result.frecency_score.cmp(&left.result.frecency_score)
+                                })
+                        })
+                        .then_with(|| left.source_index.cmp(&right.source_index))
+                });
+
+                let reserved = usize::from(self.calculator_result.is_some())
+                    + usize::from(self.web_search_result.is_some());
+                let mut results = Vec::with_capacity(RESULT_LIMIT);
+                if let Some(item) = self.calculator_result.clone() {
+                    results.push(dynamic_search_result(item));
+                }
+                results.extend(
+                    merged
+                        .into_iter()
+                        .map(|merged| merged.result)
+                        .take(RESULT_LIMIT.saturating_sub(reserved)),
                 );
                 if let Some(item) = self.web_search_result.clone() {
                     results.push(dynamic_search_result(item));
@@ -3086,7 +3215,8 @@ fn refresh_dynamic_results(state: &mut Launcher) {
     }
 
     state.calculator_result = calculator::calculator_item(&state.query);
-    state.web_search_result = web_search::web_search_item(&state.query);
+    state.web_search_result =
+        web_search::web_search_item(&state.query, state.store_data.settings.search_engine);
 }
 
 fn clear_dynamic_results(state: &mut Launcher) {
@@ -3101,6 +3231,67 @@ fn dynamic_search_result(item: CatalogItem) -> SearchResult {
         match_score: 0,
         pinned: false,
         frecency_score: 0,
+    }
+}
+
+fn file_search_result(file: &FileResult) -> SearchResult {
+    SearchResult {
+        item: file.item.clone(),
+        match_kind: None,
+        match_score: 0,
+        pinned: false,
+        frecency_score: 0,
+    }
+}
+
+fn catalog_match_tier(result: &SearchResult, query: &str) -> RootMatchTier {
+    let query = query.trim();
+    if item_has_exact_match(&result.item, query) {
+        RootMatchTier::Exact
+    } else {
+        match result.match_kind {
+            Some(MatchKind::Prefix) => RootMatchTier::Prefix,
+            Some(MatchKind::Substring) => RootMatchTier::Substring,
+            Some(MatchKind::Subsequence) => RootMatchTier::Subsequence,
+            None => RootMatchTier::Content,
+        }
+    }
+}
+
+fn item_has_exact_match(item: &CatalogItem, query: &str) -> bool {
+    let query = query.to_lowercase();
+    std::iter::once(item.title.as_str())
+        .chain(item.subtitle.as_deref())
+        .chain(item.keywords.iter().map(String::as_str))
+        .any(|candidate| candidate.to_lowercase() == query)
+}
+
+fn file_match_tier(file: &FileResult, query: &str) -> RootMatchTier {
+    if matches!(
+        file.match_kind,
+        platform::FileSearchMatchKind::DirectPath | platform::FileSearchMatchKind::FuzzyPath
+    ) {
+        return RootMatchTier::Path;
+    }
+    if file.match_kind == platform::FileSearchMatchKind::Content {
+        return RootMatchTier::Content;
+    }
+
+    let query = query.trim().to_lowercase();
+    let name = file.item.title.to_lowercase();
+    if name == query {
+        RootMatchTier::Exact
+    } else if name.starts_with(&query) {
+        RootMatchTier::Prefix
+    } else if name
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(&query))
+    {
+        RootMatchTier::WordPrefix
+    } else if name.contains(&query) {
+        RootMatchTier::Substring
+    } else {
+        RootMatchTier::Subsequence
     }
 }
 
@@ -3571,7 +3762,7 @@ mod tests {
             input_source_to_restore: None,
             file_search_revision: 0,
             file_search_pending: false,
-            file_search_in_progress: false,
+            file_search_active_revision: None,
             file_query_changed_at: Instant::now(),
             file_results: Vec::new(),
             file_search_error: None,
@@ -3596,6 +3787,27 @@ mod tests {
             integrations: None,
             notice: None,
         }
+    }
+
+    fn file_result(path: impl Into<PathBuf>, title: impl Into<String>) -> FileResult {
+        let mut item = CatalogItem::path(path, title);
+        item.pinnable = false;
+        FileResult {
+            item,
+            match_kind: platform::FileSearchMatchKind::FileName,
+        }
+    }
+
+    fn direct_path_result(path: impl Into<PathBuf>, title: impl Into<String>) -> FileResult {
+        let mut result = file_result(path, title);
+        result.match_kind = platform::FileSearchMatchKind::DirectPath;
+        result
+    }
+
+    fn fuzzy_path_result(path: impl Into<PathBuf>, title: impl Into<String>) -> FileResult {
+        let mut result = file_result(path, title);
+        result.match_kind = platform::FileSearchMatchKind::FuzzyPath;
+        result
     }
 
     #[test]
@@ -3635,6 +3847,47 @@ mod tests {
             Some(LaunchAction::OpenUrl { .. })
         ));
         assert!(results.iter().all(|result| !result.item.pinnable));
+    }
+
+    #[test]
+    fn web_search_engine_setting_persists_and_refreshes_the_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.store = Some(store.clone());
+
+        let _ = update(
+            &mut launcher,
+            Message::QueryChanged("rust launcher".to_owned()),
+        );
+        assert_eq!(
+            launcher
+                .web_search_result
+                .as_ref()
+                .map(|item| item.title.as_str()),
+            Some("Search Google for “rust launcher”")
+        );
+
+        let _ = update(
+            &mut launcher,
+            Message::SetSearchEngine(SearchEngine::DuckDuckGo),
+        );
+
+        assert_eq!(
+            launcher.store_data.settings.search_engine,
+            SearchEngine::DuckDuckGo
+        );
+        assert_eq!(
+            launcher
+                .web_search_result
+                .as_ref()
+                .map(|item| item.title.as_str()),
+            Some("Search DuckDuckGo for “rust launcher”")
+        );
+        assert_eq!(
+            store.load().unwrap().data.settings.search_engine,
+            SearchEngine::DuckDuckGo
+        );
     }
 
     #[test]
@@ -3753,11 +4006,10 @@ mod tests {
             "Report Viewer",
         ));
         let _ = update(&mut launcher, Message::QueryChanged("report".to_owned()));
-        launcher.file_results = vec![CatalogItem::path(
+        launcher.file_results = vec![file_result(
             "/Users/example/Documents/report.pdf",
             "report.pdf",
         )];
-        launcher.file_results[0].pinnable = false;
 
         let results = launcher.results();
 
@@ -3772,6 +4024,141 @@ mod tests {
             results[1].item.action,
             LaunchAction::OpenPath { .. }
         ));
+    }
+
+    #[test]
+    fn root_path_queries_promote_file_results_above_catalog_matches() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Documents Report.app",
+            "Documents/report",
+        ));
+        let _ = update(
+            &mut launcher,
+            Message::QueryChanged("Documents/report".to_owned()),
+        );
+        launcher.file_results = vec![direct_path_result(
+            "/Users/example/Documents/report.pdf",
+            "report.pdf",
+        )];
+
+        let results = launcher.results();
+
+        assert!(matches!(
+            results[0].item.action,
+            LaunchAction::OpenPath { .. }
+        ));
+        assert_eq!(results[0].item.title, "report.pdf");
+        assert_eq!(results[1].item.title, "Documents/report");
+    }
+
+    #[test]
+    fn fuzzy_path_results_promote_file_results_above_catalog_matches() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Documents Report.app",
+            "Documents/report",
+        ));
+        let _ = update(
+            &mut launcher,
+            Message::QueryChanged("Documents/report".to_owned()),
+        );
+        launcher.file_results = vec![fuzzy_path_result(
+            "/Users/example/Documents/reports",
+            "reports",
+        )];
+
+        let results = launcher.results();
+
+        assert!(matches!(
+            results[0].item.action,
+            LaunchAction::OpenPath { .. }
+        ));
+        assert_eq!(results[0].item.title, "reports");
+    }
+
+    #[test]
+    fn exact_file_name_beats_a_weaker_application_fuzzy_match() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Related.app",
+            "r-e-p-o-r-t helper",
+        ));
+        let _ = update(&mut launcher, Message::QueryChanged("report".to_owned()));
+        launcher.file_results = vec![file_result("/Users/example/report", "report")];
+
+        let results = launcher.results();
+
+        assert_eq!(results[0].item.title, "report");
+        assert_eq!(results[1].item.title, "r-e-p-o-r-t helper");
+    }
+
+    #[test]
+    fn exact_application_wins_a_tie_with_an_exact_file_name() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Report.app",
+            "report",
+        ));
+        let _ = update(&mut launcher, Message::QueryChanged("report".to_owned()));
+        launcher.file_results = vec![file_result("/Users/example/report", "report")];
+
+        let results = launcher.results();
+
+        assert!(matches!(
+            results[0].item.action,
+            LaunchAction::OpenApplication { .. }
+        ));
+        assert!(matches!(
+            results[1].item.action,
+            LaunchAction::OpenPath { .. }
+        ));
+    }
+
+    #[test]
+    fn content_only_file_results_stay_below_file_name_matches() {
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        let _ = update(&mut launcher, Message::QueryChanged("report".to_owned()));
+        let mut content_match = file_result("/Users/example/report", "report");
+        content_match.match_kind = platform::FileSearchMatchKind::Content;
+        launcher.file_results = vec![
+            content_match,
+            file_result("/Users/example/report-archive", "report-archive"),
+        ];
+
+        let results = launcher.results();
+
+        assert_eq!(results[0].item.title, "report-archive");
+        assert_eq!(results[1].item.title, "report");
+    }
+
+    #[test]
+    fn starting_a_new_file_search_does_not_wait_for_an_older_revision() {
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.query = "report".to_owned();
+        launcher.file_search_revision = 12;
+        launcher.file_search_pending = true;
+        launcher.file_search_active_revision = Some(11);
+        launcher.file_query_changed_at =
+            Instant::now() - FILE_SEARCH_DEBOUNCE - Duration::from_millis(1);
+
+        let _ = maybe_start_file_search(&mut launcher);
+
+        assert!(!launcher.file_search_pending);
+        assert_eq!(launcher.file_search_active_revision, Some(12));
+    }
+
+    #[test]
+    fn stale_file_search_completion_does_not_clear_latest_search_state() {
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.file_search_revision = 12;
+        launcher.file_search_active_revision = Some(12);
+
+        let _ = update(
+            &mut launcher,
+            Message::FileSearchFinished {
+                revision: 11,
+                result: Ok(Vec::new()),
+            },
+        );
+
+        assert_eq!(launcher.file_search_active_revision, Some(12));
     }
 
     #[test]

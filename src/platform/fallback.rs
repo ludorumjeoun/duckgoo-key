@@ -41,7 +41,7 @@ pub fn execute_system_command(_command: &SystemCommand) -> Result<()> {
     Err(unsupported("executing system commands"))
 }
 
-pub fn search_files(_query: &str, _limit: usize) -> Result<Vec<PathBuf>> {
+pub fn search_files(_query: &str, _limit: usize) -> Result<Vec<super::FileSearchResult>> {
     Err(unsupported("searching files"))
 }
 

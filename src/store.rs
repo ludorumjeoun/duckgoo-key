@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,24 @@ pub const STORE_SCHEMA_VERSION: u32 = 2;
 const STORE_FILE_NAME: &str = "state.json";
 static UNIQUE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchEngine {
+    #[default]
+    #[serde(rename = "google")]
+    Google,
+    #[serde(rename = "duckduckgo")]
+    DuckDuckGo,
+}
+
+impl fmt::Display for SearchEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Google => "Google",
+            Self::DuckDuckGo => "DuckDuckGo",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
@@ -33,6 +52,9 @@ pub struct AppSettings {
     /// Anonymous release telemetry is sent only after the user opts in.
     #[serde(default)]
     pub anonymous_usage_stats_enabled: bool,
+    /// Search engine used by the dynamic web-search fallback.
+    #[serde(default)]
+    pub search_engine: SearchEngine,
 }
 
 impl Default for AppSettings {
@@ -43,6 +65,7 @@ impl Default for AppSettings {
             clipboard_history_enabled: false,
             update_checks_enabled: default_update_checks_enabled(),
             anonymous_usage_stats_enabled: false,
+            search_engine: SearchEngine::default(),
         }
     }
 }
@@ -572,6 +595,7 @@ mod tests {
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
         assert!(data.settings.update_checks_enabled);
+        assert_eq!(data.settings.search_engine, SearchEngine::Google);
     }
 
     #[test]
@@ -584,6 +608,7 @@ mod tests {
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
         assert!(data.settings.update_checks_enabled);
+        assert_eq!(data.settings.search_engine, SearchEngine::Google);
     }
 
     #[test]
@@ -592,6 +617,7 @@ mod tests {
         let store = Store::at(directory.path().join("state.json"));
         let mut data = StoreData::default();
         data.settings.preferred_input_source = Some("com.apple.keylayout.ABC".to_owned());
+        data.settings.search_engine = SearchEngine::DuckDuckGo;
 
         store.save(&data).unwrap();
         let loaded = store.load().unwrap().data;
@@ -601,6 +627,7 @@ mod tests {
             loaded.settings.preferred_input_source.as_deref(),
             Some("com.apple.keylayout.ABC")
         );
+        assert_eq!(loaded.settings.search_engine, SearchEngine::DuckDuckGo);
     }
 
     #[test]
