@@ -191,29 +191,43 @@ verify_checksum_file "DuckGooKey-$version-macos-x86_64.SHA256SUMS"
 
 aarch64_dmg="DuckGooKey-$version-macos-aarch64.dmg"
 x86_64_dmg="DuckGooKey-$version-macos-x86_64.dmg"
+aarch64_app="DuckGooKey-$version-macos-aarch64.app.zip"
+x86_64_app="DuckGooKey-$version-macos-x86_64.app.zip"
 aarch64_sha256="$(sha256_file "$artifacts_dir/$aarch64_dmg")"
 x86_64_sha256="$(sha256_file "$artifacts_dir/$x86_64_dmg")"
+aarch64_app_sha256="$(sha256_file "$artifacts_dir/$aarch64_app")"
+x86_64_app_sha256="$(sha256_file "$artifacts_dir/$x86_64_app")"
 aarch64_url="$base_url/releases/v$version/$aarch64_dmg"
 x86_64_url="$base_url/releases/v$version/$x86_64_dmg"
+aarch64_app_url="$base_url/releases/v$version/$aarch64_app"
+x86_64_app_url="$base_url/releases/v$version/$x86_64_app"
 
 jq -e \
   --arg version "$version" \
   --arg aarch64_url "$aarch64_url" \
   --arg aarch64_sha256 "$aarch64_sha256" \
+  --arg aarch64_app_url "$aarch64_app_url" \
+  --arg aarch64_app_sha256 "$aarch64_app_sha256" \
   --arg x86_64_url "$x86_64_url" \
   --arg x86_64_sha256 "$x86_64_sha256" \
+  --arg x86_64_app_url "$x86_64_app_url" \
+  --arg x86_64_app_sha256 "$x86_64_app_sha256" \
   '
     .version == $version
     and (.pub_date | type == "string")
     and (.pub_date | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
     and (keys | sort == ["platforms", "pub_date", "version"])
     and (.platforms | keys | sort == ["macos-aarch64", "macos-x86_64"])
-    and (.platforms["macos-aarch64"] | keys | sort == ["sha256", "url"])
+    and (.platforms["macos-aarch64"] | keys | sort == ["app_sha256", "app_url", "sha256", "url"])
     and .platforms["macos-aarch64"].url == $aarch64_url
     and .platforms["macos-aarch64"].sha256 == $aarch64_sha256
-    and (.platforms["macos-x86_64"] | keys | sort == ["sha256", "url"])
+    and .platforms["macos-aarch64"].app_url == $aarch64_app_url
+    and .platforms["macos-aarch64"].app_sha256 == $aarch64_app_sha256
+    and (.platforms["macos-x86_64"] | keys | sort == ["app_sha256", "app_url", "sha256", "url"])
     and .platforms["macos-x86_64"].url == $x86_64_url
     and .platforms["macos-x86_64"].sha256 == $x86_64_sha256
+    and .platforms["macos-x86_64"].app_url == $x86_64_app_url
+    and .platforms["macos-x86_64"].app_sha256 == $x86_64_app_sha256
   ' "$manifest" >/dev/null || die "manifest does not match the release artifacts"
 
 aws_r2() {
@@ -473,6 +487,14 @@ verify_public_bytes \
   "$artifacts_dir/$x86_64_dmg" \
   "$x86_64_url" \
   "$x86_64_dmg"
+verify_public_bytes \
+  "$artifacts_dir/$aarch64_app" \
+  "$aarch64_app_url" \
+  "$aarch64_app"
+verify_public_bytes \
+  "$artifacts_dir/$x86_64_app" \
+  "$x86_64_app_url" \
+  "$x86_64_app"
 verify_public_bytes \
   "$manifest" \
   "$base_url/$release_prefix/release.json" \

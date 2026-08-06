@@ -17,7 +17,7 @@ pub const STORE_SCHEMA_VERSION: u32 = 2;
 const STORE_FILE_NAME: &str = "state.json";
 static UNIQUE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
     pub shortcut: ShortcutBinding,
@@ -27,6 +27,20 @@ pub struct AppSettings {
     /// Clipboard contents are recorded only after the user explicitly opts in.
     #[serde(default)]
     pub clipboard_history_enabled: bool,
+    /// Update checks are enabled by default, including for existing settings files.
+    #[serde(default = "default_update_checks_enabled")]
+    pub update_checks_enabled: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            shortcut: ShortcutBinding::default(),
+            preferred_input_source: None,
+            clipboard_history_enabled: false,
+            update_checks_enabled: default_update_checks_enabled(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +168,10 @@ const fn default_next_quick_link_id() -> u64 {
 
 const fn default_next_clipboard_entry_id() -> u64 {
     1
+}
+
+const fn default_update_checks_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -541,6 +559,7 @@ mod tests {
         assert_eq!(data.settings, AppSettings::default());
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
+        assert!(data.settings.update_checks_enabled);
     }
 
     #[test]
@@ -552,6 +571,7 @@ mod tests {
 
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
+        assert!(data.settings.update_checks_enabled);
     }
 
     #[test]

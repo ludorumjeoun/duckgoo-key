@@ -25,6 +25,7 @@ use crate::platform;
 use crate::quick_link::QuickLink;
 use crate::shortcut::ShortcutBinding;
 use crate::store::{Store, StoreData};
+use crate::updater;
 use crate::web_search;
 
 const RESULT_LIMIT: usize = 6;
@@ -33,6 +34,7 @@ const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
 const FILE_SEARCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(220);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FILE_RESULT_LIMIT: usize = 50;
 
 const TEXT_PRIMARY: Color = Color {
@@ -117,6 +119,9 @@ struct Launcher {
     file_search_error: Option<String>,
     clipboard_change_count: Option<i64>,
     clipboard_error: Option<String>,
+    update_checking: bool,
+    update_installing: bool,
+    available_update: Option<updater::AvailableUpdate>,
     quick_link_title: String,
     quick_link_url: String,
     editing_quick_link_id: Option<u64>,
@@ -225,6 +230,15 @@ enum Message {
     RequestDeleteQuickLink(u64),
     CancelQuickLinkEdit,
     SetClipboardHistoryEnabled(bool),
+    SetUpdateChecksEnabled(bool),
+    CheckForUpdates,
+    UpdateCheckTick,
+    UpdateCheckFinished {
+        manual: bool,
+        result: Result<updater::CheckResult, String>,
+    },
+    InstallAvailableUpdate,
+    UpdateInstallPrepared(Result<(), String>),
     RequestClearClipboardHistory,
     ConfirmPending,
     CancelConfirmation,
@@ -292,6 +306,7 @@ fn boot() -> (Launcher, Task<Message>) {
     let quick_link_title_input = widget::Id::unique();
     let quick_link_url_input = widget::Id::unique();
     let (store, store_data, notice) = load_store();
+    let update_checks_enabled = store_data.settings.update_checks_enabled;
     let (input_sources, input_source_error) = load_input_sources();
     let (clipboard_change_count, clipboard_error) = if store_data.settings.clipboard_history_enabled
     {
@@ -360,6 +375,9 @@ fn boot() -> (Launcher, Task<Message>) {
         file_search_error: None,
         clipboard_change_count,
         clipboard_error,
+        update_checking: update_checks_enabled,
+        update_installing: false,
+        available_update: None,
         quick_link_title: String::new(),
         quick_link_url: String::new(),
         editing_quick_link_id: None,
@@ -383,6 +401,11 @@ fn boot() -> (Launcher, Task<Message>) {
         Task::batch([
             opened.map(Message::WindowOpened),
             discover_catalog(CatalogScanSource::Startup),
+            if update_checks_enabled {
+                check_for_updates(false)
+            } else {
+                Task::none()
+            },
         ]),
     )
 }
@@ -546,6 +569,90 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         Message::SetClipboardHistoryEnabled(enabled) => {
             set_clipboard_history_enabled(state, enabled);
             Task::none()
+        }
+        Message::SetUpdateChecksEnabled(enabled) => {
+            set_update_checks_enabled(state, enabled);
+            Task::none()
+        }
+        Message::CheckForUpdates => {
+            if state.update_checking || state.update_installing {
+                Task::none()
+            } else {
+                state.update_checking = true;
+                check_for_updates(true)
+            }
+        }
+        Message::UpdateCheckTick => {
+            if !state.store_data.settings.update_checks_enabled
+                || state.update_checking
+                || state.update_installing
+                || state.available_update.is_some()
+            {
+                Task::none()
+            } else {
+                state.update_checking = true;
+                check_for_updates(false)
+            }
+        }
+        Message::UpdateCheckFinished { manual, result } => {
+            state.update_checking = false;
+            match result {
+                Ok(updater::CheckResult::UpToDate) => {
+                    state.available_update = None;
+                    if manual {
+                        state.notice = Some(Notice::info(format!(
+                            "DuckGooKey {} is up to date",
+                            env!("CARGO_PKG_VERSION")
+                        )));
+                    }
+                }
+                Ok(updater::CheckResult::Available(update)) => {
+                    state.notice = Some(Notice::info(format!(
+                        "DuckGooKey {} is ready to install",
+                        update.version
+                    )));
+                    state.available_update = Some(update);
+                }
+                Err(error) => {
+                    if manual {
+                        state.notice = Some(Notice::error(format!(
+                            "Could not check for updates: {error}"
+                        )));
+                    } else {
+                        tracing::warn!(error = %error, "Automatic update check failed");
+                    }
+                }
+            }
+            Task::none()
+        }
+        Message::InstallAvailableUpdate => {
+            let Some(update) = state.available_update.clone() else {
+                return Task::none();
+            };
+            if state.update_installing {
+                return Task::none();
+            }
+            state.update_installing = true;
+            Task::perform(
+                async move {
+                    updater::download_and_prepare_install(update)
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                Message::UpdateInstallPrepared,
+            )
+        }
+        Message::UpdateInstallPrepared(result) => {
+            state.update_installing = false;
+            match result {
+                Ok(()) => iced::exit(),
+                Err(error) => {
+                    state.notice = Some(Notice::error(format!(
+                        "Could not install the update: {error}"
+                    )));
+                    Task::none()
+                }
+            }
         }
         Message::RequestClearClipboardHistory => request_clear_clipboard_history(state),
         Message::ConfirmPending => confirm_pending(state),
@@ -1324,6 +1431,31 @@ fn set_clipboard_history_enabled(state: &mut Launcher, enabled: bool) {
     }
 }
 
+fn set_update_checks_enabled(state: &mut Launcher, enabled: bool) {
+    if state.store_data.settings.update_checks_enabled == enabled {
+        return;
+    }
+
+    let mut candidate = state.store_data.clone();
+    candidate.settings.update_checks_enabled = enabled;
+    if save_candidate(state, &candidate).is_err() {
+        return;
+    }
+    state.store_data = candidate;
+    state.notice = Some(Notice::info(if enabled {
+        "Automatic update checks enabled"
+    } else {
+        "Automatic update checks disabled"
+    }));
+}
+
+fn check_for_updates(manual: bool) -> Task<Message> {
+    Task::perform(
+        async { updater::check().await.map_err(|error| error.to_string()) },
+        move |result| Message::UpdateCheckFinished { manual, result },
+    )
+}
+
 fn request_clear_clipboard_history(state: &mut Launcher) -> Task<Message> {
     if state.store_data.clipboard_history.is_empty() {
         return Task::none();
@@ -1998,6 +2130,63 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     .width(Fill)
     .style(settings_card_style);
 
+    let update_detail = if state.update_installing {
+        "Downloading and preparing a verified update…".to_owned()
+    } else if state.update_checking {
+        "Checking the DuckGooKey update channel…".to_owned()
+    } else if let Some(update) = &state.available_update {
+        format!("Version {} is ready", update.version)
+    } else {
+        format!(
+            "Version {} · checks every 6 hours",
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+    let update_action: Element<'_, Message> = if let Some(update) = &state.available_update {
+        let update_button_label = if state.update_installing {
+            "Preparing…".to_owned()
+        } else {
+            format!("Install {}", update.version)
+        };
+        button(text(update_button_label).size(12))
+            .padding([8, 12])
+            .on_press_maybe((!state.update_installing).then_some(Message::InstallAvailableUpdate))
+            .style(accent_button_style)
+            .into()
+    } else {
+        button(
+            text(if state.update_checking {
+                "Checking…"
+            } else {
+                "Check now"
+            })
+            .size(12),
+        )
+        .padding([8, 12])
+        .on_press_maybe((!state.update_checking).then_some(Message::CheckForUpdates))
+        .style(secondary_button_style)
+        .into()
+    };
+    let updates_card = container(
+        iced::widget::row![
+            iced::widget::column![
+                text("Updates").size(14).color(TEXT_PRIMARY),
+                text(update_detail).size(11).color(TEXT_SECONDARY),
+            ]
+            .spacing(4)
+            .width(Fill),
+            update_action,
+            toggler(state.store_data.settings.update_checks_enabled)
+                .on_toggle(Message::SetUpdateChecksEnabled)
+                .size(22),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding(15)
+    .width(Fill)
+    .style(settings_card_style);
+
     let clipboard_enabled = state.store_data.settings.clipboard_history_enabled;
     let clipboard_count = state.store_data.clipboard_history.len();
     let clipboard_detail = state.clipboard_error.as_deref().map_or_else(
@@ -2206,6 +2395,7 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     let settings_sections = iced::widget::column![
         text("GENERAL").size(10).color(TEXT_SECONDARY),
         login_card,
+        updates_card,
         text("KEYBOARD").size(10).color(TEXT_SECONDARY),
         shortcut_card,
         reset_shortcut,
@@ -2564,6 +2754,7 @@ fn subscription(_state: &Launcher) -> Subscription<Message> {
         time::every(AUTO_DISCOVERY_INTERVAL).map(|_| Message::CatalogScanTick),
         time::every(FILE_SEARCH_TICK_INTERVAL).map(|_| Message::FileSearchTick),
         time::every(CLIPBOARD_POLL_INTERVAL).map(|_| Message::ClipboardPollTick),
+        time::every(UPDATE_CHECK_INTERVAL).map(|_| Message::UpdateCheckTick),
     ])
 }
 
@@ -3146,6 +3337,9 @@ mod tests {
             file_search_error: None,
             clipboard_change_count: None,
             clipboard_error: None,
+            update_checking: false,
+            update_installing: false,
+            available_update: None,
             quick_link_title: String::new(),
             quick_link_url: String::new(),
             editing_quick_link_id: None,

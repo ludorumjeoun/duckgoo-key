@@ -9,6 +9,7 @@ pub mod platform;
 pub mod quick_link;
 pub mod shortcut;
 pub mod store;
+pub mod updater;
 pub mod web_search;
 
 pub use app::run;

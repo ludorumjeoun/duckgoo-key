@@ -229,6 +229,8 @@ artifacts_dir="$temporary_dir/artifacts"
 mkdir -p "$artifacts_dir"
 printf 'arm64 installer\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-aarch64.dmg"
 printf 'Intel installer\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-x86_64.dmg"
+printf 'arm64 application\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-aarch64.app.zip"
+printf 'Intel application\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-x86_64.app.zip"
 
 "$project_dir/scripts/build-release-manifest.sh" \
   --version 1.2.3 \
@@ -244,11 +246,12 @@ jq -e '
     == "https://updates.key.duckgoo.net/releases/v1.2.3/DuckGooKey-1.2.3-macos-aarch64.dmg"
   and .platforms["macos-x86_64"].url
     == "https://updates.key.duckgoo.net/releases/v1.2.3/DuckGooKey-1.2.3-macos-x86_64.dmg"
+  and .platforms["macos-aarch64"].app_url
+    == "https://updates.key.duckgoo.net/releases/v1.2.3/DuckGooKey-1.2.3-macos-aarch64.app.zip"
+  and .platforms["macos-x86_64"].app_url
+    == "https://updates.key.duckgoo.net/releases/v1.2.3/DuckGooKey-1.2.3-macos-x86_64.app.zip"
 ' "$artifacts_dir/latest.json" >/dev/null \
   || fail "release manifest did not preserve the public artifact contract"
-
-printf 'arm64 application\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-aarch64.app.zip"
-printf 'Intel application\n' > "$artifacts_dir/DuckGooKey-1.2.3-macos-x86_64.app.zip"
 (
   cd "$artifacts_dir"
   shasum -a 256 \
@@ -300,12 +303,15 @@ run_fake_publisher() {
 run_fake_publisher 1.2.3 "$artifacts_dir"
 
 installer_cdn_line="$(awk '/^curl releases\/v1.2.3\/DuckGooKey-1.2.3-macos-aarch64.dmg$/ { print NR; exit }' "$fake_r2_log")"
+archive_cdn_line="$(awk '/^curl releases\/v1.2.3\/DuckGooKey-1.2.3-macos-aarch64.app.zip$/ { print NR; exit }' "$fake_r2_log")"
 latest_put_line="$(awk '/^put latest.json / { print NR; exit }' "$fake_r2_log")"
 latest_cdn_line="$(awk '/^curl latest.json$/ { print NR; exit }' "$fake_r2_log")"
-[[ -n "$installer_cdn_line" && -n "$latest_put_line" && -n "$latest_cdn_line" ]] \
+[[ -n "$installer_cdn_line" && -n "$archive_cdn_line" && -n "$latest_put_line" && -n "$latest_cdn_line" ]] \
   || fail "publisher did not exercise the CDN and latest.json path"
 (( installer_cdn_line < latest_put_line )) \
   || fail "publisher advertised latest.json before verifying installers through the CDN"
+(( archive_cdn_line < latest_put_line )) \
+  || fail "publisher advertised latest.json before verifying update archives through the CDN"
 (( latest_put_line < latest_cdn_line )) \
   || fail "publisher did not verify latest.json after its conditional update"
 grep -q '^put latest.json if-none-match=\*$' "$fake_r2_log" \

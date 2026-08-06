@@ -11,8 +11,9 @@ Usage:
     --artifacts-dir DIRECTORY \
     --output FILE
 
-Builds the DuckGooKey latest.json manifest for the two macOS DMG files in
-DIRECTORY. Artifact URLs use the immutable releases/vVERSION/ object prefix.
+Builds the DuckGooKey latest.json manifest for the two macOS DMG installers and
+app bundle ZIP files in DIRECTORY. Artifact URLs use the immutable
+releases/vVERSION/ object prefix.
 EOF
 }
 
@@ -111,16 +112,26 @@ sha256_file() {
 
 aarch64_name="DuckGooKey-$version-macos-aarch64.dmg"
 x86_64_name="DuckGooKey-$version-macos-x86_64.dmg"
+aarch64_app_name="DuckGooKey-$version-macos-aarch64.app.zip"
+x86_64_app_name="DuckGooKey-$version-macos-x86_64.app.zip"
 aarch64_path="$artifacts_dir/$aarch64_name"
 x86_64_path="$artifacts_dir/$x86_64_name"
+aarch64_app_path="$artifacts_dir/$aarch64_app_name"
+x86_64_app_path="$artifacts_dir/$x86_64_app_name"
 
 [[ -s "$aarch64_path" ]] || die "missing or empty release artifact: $aarch64_path"
 [[ -s "$x86_64_path" ]] || die "missing or empty release artifact: $x86_64_path"
+[[ -s "$aarch64_app_path" ]] || die "missing or empty release artifact: $aarch64_app_path"
+[[ -s "$x86_64_app_path" ]] || die "missing or empty release artifact: $x86_64_app_path"
 
 aarch64_sha256="$(sha256_file "$aarch64_path")"
 x86_64_sha256="$(sha256_file "$x86_64_path")"
+aarch64_app_sha256="$(sha256_file "$aarch64_app_path")"
+x86_64_app_sha256="$(sha256_file "$x86_64_app_path")"
 aarch64_url="$base_url/releases/v$version/$aarch64_name"
 x86_64_url="$base_url/releases/v$version/$x86_64_name"
+aarch64_app_url="$base_url/releases/v$version/$aarch64_app_name"
+x86_64_app_url="$base_url/releases/v$version/$x86_64_app_name"
 
 output_dir="$(dirname "$output")"
 mkdir -p "$output_dir"
@@ -135,19 +146,27 @@ jq -n \
   --arg pub_date "$pub_date" \
   --arg aarch64_url "$aarch64_url" \
   --arg aarch64_sha256 "$aarch64_sha256" \
+  --arg aarch64_app_url "$aarch64_app_url" \
+  --arg aarch64_app_sha256 "$aarch64_app_sha256" \
   --arg x86_64_url "$x86_64_url" \
   --arg x86_64_sha256 "$x86_64_sha256" \
+  --arg x86_64_app_url "$x86_64_app_url" \
+  --arg x86_64_app_sha256 "$x86_64_app_sha256" \
   '{
     version: $version,
     pub_date: $pub_date,
     platforms: {
       "macos-aarch64": {
         url: $aarch64_url,
-        sha256: $aarch64_sha256
+        sha256: $aarch64_sha256,
+        app_url: $aarch64_app_url,
+        app_sha256: $aarch64_app_sha256
       },
       "macos-x86_64": {
         url: $x86_64_url,
-        sha256: $x86_64_sha256
+        sha256: $x86_64_sha256,
+        app_url: $x86_64_app_url,
+        app_sha256: $x86_64_app_sha256
       }
     }
   }' > "$tmp_output"
@@ -155,10 +174,12 @@ jq -n \
 jq -e \
   '(keys | sort == ["platforms", "pub_date", "version"])
    and (.platforms | keys | sort == ["macos-aarch64", "macos-x86_64"])
-   and (.platforms["macos-aarch64"] | keys | sort == ["sha256", "url"])
-   and (.platforms["macos-x86_64"] | keys | sort == ["sha256", "url"])
+   and (.platforms["macos-aarch64"] | keys | sort == ["app_sha256", "app_url", "sha256", "url"])
+   and (.platforms["macos-x86_64"] | keys | sort == ["app_sha256", "app_url", "sha256", "url"])
    and (.platforms["macos-aarch64"].sha256 | test("^[0-9a-f]{64}$"))
-   and (.platforms["macos-x86_64"].sha256 | test("^[0-9a-f]{64}$"))' \
+   and (.platforms["macos-x86_64"].sha256 | test("^[0-9a-f]{64}$"))
+   and (.platforms["macos-aarch64"].app_sha256 | test("^[0-9a-f]{64}$"))
+   and (.platforms["macos-x86_64"].app_sha256 | test("^[0-9a-f]{64}$"))' \
   "$tmp_output" >/dev/null
 
 mv "$tmp_output" "$output"
