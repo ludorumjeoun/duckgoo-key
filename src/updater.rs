@@ -72,8 +72,13 @@ struct ReleaseManifest {
 struct PlatformRelease {
     url: String,
     sha256: String,
-    app_url: String,
-    app_sha256: String,
+    /// v0.1.0 manifests predate the in-place updater and intentionally have no
+    /// application archive. Keep parsing them compatible so an already newer
+    /// app can correctly report itself as up to date.
+    #[serde(default)]
+    app_url: Option<String>,
+    #[serde(default)]
+    app_sha256: Option<String>,
 }
 
 pub async fn check() -> Result<CheckResult, UpdateError> {
@@ -103,29 +108,36 @@ pub async fn check() -> Result<CheckResult, UpdateError> {
         return Err(UpdateError::ManifestTooLarge);
     }
 
-    let manifest: ReleaseManifest = serde_json::from_slice(&body)
+    check_manifest(&body, env!("CARGO_PKG_VERSION"), current_platform()?)
+}
+
+fn check_manifest(
+    body: &[u8],
+    current_version_raw: &str,
+    platform: &'static str,
+) -> Result<CheckResult, UpdateError> {
+    let manifest: ReleaseManifest = serde_json::from_slice(body)
         .map_err(|error| UpdateError::InvalidManifest(error.to_string()))?;
     let remote_version = Version::parse(&manifest.version)
         .map_err(|error| UpdateError::InvalidManifest(format!("invalid version: {error}")))?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("Cargo package version must be valid SemVer");
+    let current_version =
+        Version::parse(current_version_raw).expect("Cargo package version must be valid SemVer");
 
     if remote_version.cmp_precedence(&current_version).is_le() {
         return Ok(CheckResult::UpToDate);
     }
 
-    let platform = current_platform()?;
     let release = manifest.platforms.get(platform).ok_or_else(|| {
         UpdateError::InvalidManifest(format!("missing platform release for {platform}"))
     })?;
-    validate_release(platform, &manifest.version, release)?;
+    let (app_url, app_sha256) = validate_release(platform, &manifest.version, release)?;
 
     Ok(CheckResult::Available(AvailableUpdate {
         version: manifest.version,
         platform,
-        archive_url: Url::parse(&release.app_url)
+        archive_url: Url::parse(app_url)
             .map_err(|error| UpdateError::InvalidManifest(error.to_string()))?,
-        archive_sha256: release.app_sha256.clone(),
+        archive_sha256: app_sha256.to_owned(),
     }))
 }
 
@@ -166,16 +178,23 @@ fn current_platform() -> Result<&'static str, UpdateError> {
     }
 }
 
-fn validate_release(
+fn validate_release<'a>(
     platform: &str,
     version: &str,
-    release: &PlatformRelease,
-) -> Result<(), UpdateError> {
+    release: &'a PlatformRelease,
+) -> Result<(&'a str, &'a str), UpdateError> {
     validate_artifact_url(platform, version, &release.url, ".dmg")?;
     validate_sha256(&release.sha256)?;
-    validate_artifact_url(platform, version, &release.app_url, ".app.zip")?;
-    validate_sha256(&release.app_sha256)?;
-    Ok(())
+    let app_url = release
+        .app_url
+        .as_deref()
+        .ok_or_else(|| UpdateError::InvalidManifest(format!("missing app_url for {platform}")))?;
+    let app_sha256 = release.app_sha256.as_deref().ok_or_else(|| {
+        UpdateError::InvalidManifest(format!("missing app_sha256 for {platform}"))
+    })?;
+    validate_artifact_url(platform, version, app_url, ".app.zip")?;
+    validate_sha256(app_sha256)?;
+    Ok((app_url, app_sha256))
 }
 
 fn validate_artifact_url(
@@ -504,5 +523,41 @@ mod tests {
             sha256_hex(b"DuckGooKey"),
             "e50982a5d4b087a0ccfa5beb51a06678ccec66fcb36526972e4fcf041677d3f7"
         );
+    }
+
+    #[test]
+    fn legacy_manifest_without_app_archives_is_up_to_date_for_a_newer_app() {
+        let manifest = br#"{
+          "version": "0.1.0",
+          "platforms": {
+            "macos-aarch64": {
+              "url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-aarch64.dmg",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        }"#;
+
+        assert_eq!(
+            check_manifest(manifest, "0.1.1", "macos-aarch64").unwrap(),
+            CheckResult::UpToDate
+        );
+    }
+
+    #[test]
+    fn newer_legacy_manifest_explains_that_it_cannot_update() {
+        let manifest = br#"{
+          "version": "0.1.2",
+          "platforms": {
+            "macos-aarch64": {
+              "url": "https://updates.key.duckgoo.net/releases/v0.1.2/DuckGooKey-0.1.2-macos-aarch64.dmg",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          }
+        }"#;
+
+        assert!(matches!(
+            check_manifest(manifest, "0.1.1", "macos-aarch64"),
+            Err(UpdateError::InvalidManifest(message)) if message == "missing app_url for macos-aarch64"
+        ));
     }
 }
