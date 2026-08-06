@@ -332,7 +332,7 @@ them as ignored `mise.local.toml` defaults; see
 
 | Variable | Example |
 | --- | --- |
-| `CLOUDFLARE_R2_BUCKET` | `duckgookey-releases` |
+| `CLOUDFLARE_R2_BUCKET` | `duckgoo-key-releases` |
 | `CLOUDFLARE_R2_ENDPOINT` | `https://ACCOUNT_ID.r2.cloudflarestorage.com` |
 | `CLOUDFLARE_R2_PUBLIC_BASE_URL` | `https://updates.key.duckgoo.net` |
 
@@ -428,7 +428,7 @@ AWS_SECRET_ACCESS_KEY=... \
 AWS_DEFAULT_REGION=auto \
 ./scripts/publish-r2.sh \
   --version 0.1.0 \
-  --bucket duckgookey-releases \
+  --bucket duckgoo-key-releases \
   --endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com \
   --base-url https://updates.key.duckgoo.net \
   --artifacts-dir "/path/to/release assets" \

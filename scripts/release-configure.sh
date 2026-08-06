@@ -231,7 +231,7 @@ public_base_url=""
 prompt_value signing_identity "Developer ID Application identity" "$default_signing_identity"
 prompt_value team_id "Apple Developer Team ID" "$default_team_id"
 prompt_value notary_profile "notarytool Keychain profile" "${APPLE_KEYCHAIN_PROFILE:-duckgookey-notary}"
-prompt_value r2_bucket "Cloudflare R2 bucket" "${CLOUDFLARE_R2_BUCKET:-duckgookey-releases}"
+prompt_value r2_bucket "Cloudflare R2 bucket" "${CLOUDFLARE_R2_BUCKET:-duckgoo-key-releases}"
 prompt_value r2_endpoint "Cloudflare R2 S3 endpoint" "${CLOUDFLARE_R2_ENDPOINT:-}"
 prompt_value public_base_url "Public update base URL" "${CLOUDFLARE_R2_PUBLIC_BASE_URL:-https://updates.key.duckgoo.net}"
 

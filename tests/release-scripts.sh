@@ -65,6 +65,7 @@ import tomllib
 
 data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert data["env"]["APPLE_TEAM_ID"]["default"] == "TEAMID"
+assert data["env"]["CLOUDFLARE_R2_BUCKET"]["default"] == "duckgoo-key-releases"
 assert data["env"]["CLOUDFLARE_R2_PUBLIC_BASE_URL"]["default"] == "https://updates.key.duckgoo.net"
 PY
 grep -qF 'raw = true' "$project_dir/mise.toml" \
@@ -144,7 +145,7 @@ rm "$keychain_dir/items/CLOUDFLARE_R2_ACCESS_KEY_ID" \
       APPLE_SIGNING_IDENTITY='Developer ID Application: DuckGooKey Test (ABCDE12345)' \
       APPLE_TEAM_ID='ABCDE12345' \
       APPLE_KEYCHAIN_PROFILE='duckgookey-notary' \
-      CLOUDFLARE_R2_BUCKET='duckgookey-releases' \
+      CLOUDFLARE_R2_BUCKET='duckgoo-key-releases' \
       CLOUDFLARE_R2_ENDPOINT='https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com' \
       CLOUDFLARE_R2_PUBLIC_BASE_URL='https://updates.key.duckgoo.net' \
       "$project_dir/scripts/release-configure.sh" \
@@ -161,7 +162,7 @@ env = data["env"]
 assert env["APPLE_SIGNING_IDENTITY"]["default"] == "Developer ID Application: DuckGooKey Test (ABCDE12345)"
 assert env["APPLE_TEAM_ID"]["default"] == "ABCDE12345"
 assert env["APPLE_KEYCHAIN_PROFILE"]["default"] == "duckgookey-notary"
-assert env["CLOUDFLARE_R2_BUCKET"]["default"] == "duckgookey-releases"
+assert env["CLOUDFLARE_R2_BUCKET"]["default"] == "duckgoo-key-releases"
 assert env["CLOUDFLARE_R2_ENDPOINT"]["default"].startswith("https://0123456789abcdef")
 assert env["CLOUDFLARE_R2_PUBLIC_BASE_URL"]["default"] == "https://updates.key.duckgoo.net"
 assert "CLOUDFLARE_R2_ACCESS_KEY_ID" not in env
