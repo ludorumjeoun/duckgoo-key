@@ -45,6 +45,10 @@ run = "./scripts/release-configure.sh"
 description = "Build a signed and notarized two-architecture public release locally"
 run = "./scripts/release-local.sh"
 
+[tasks.release-prepare]
+description = "Bump version, validate, commit, tag, and optionally push a public release"
+run = "./scripts/release-prepare.sh"
+
 [tasks.icons]
 description = "Rebuild the brand icon assets from a source image"
 run = '''

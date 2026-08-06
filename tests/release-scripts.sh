@@ -40,6 +40,8 @@ fi
 "$project_dir/scripts/release-local.sh" --help >/dev/null
 "$project_dir/scripts/publish-r2.sh" --help >/dev/null
 "$project_dir/scripts/release-configure.sh" --help >/dev/null
+"$project_dir/scripts/release-prepare.sh" --help >/dev/null
+bash -n "$project_dir/scripts/release-prepare.sh"
 
 keychain_dir="$temporary_dir/fake-keychain"
 keychain_log="$temporary_dir/fake-keychain.log"
@@ -70,6 +72,8 @@ assert data["env"]["CLOUDFLARE_R2_PUBLIC_BASE_URL"]["default"] == "https://updat
 PY
 grep -qF 'raw = true' "$project_dir/mise.toml" \
   || fail "release configuration task is not raw and cannot prompt reliably"
+grep -qF '[tasks.release-prepare]' "$project_dir/mise.toml" \
+  || fail "release preparation task is not registered with Mise"
 
 # The complete environment pair wins without touching Keychain.
 (
