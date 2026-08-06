@@ -39,6 +39,168 @@ fi
 "$project_dir/scripts/package-macos-release-arch.sh" --help >/dev/null
 "$project_dir/scripts/release-local.sh" --help >/dev/null
 "$project_dir/scripts/publish-r2.sh" --help >/dev/null
+"$project_dir/scripts/release-configure.sh" --help >/dev/null
+
+keychain_dir="$temporary_dir/fake-keychain"
+keychain_log="$temporary_dir/fake-keychain.log"
+fake_mise_log="$temporary_dir/fake-mise.log"
+mkdir -p "$keychain_dir/items"
+: > "$keychain_log"
+: > "$fake_mise_log"
+
+if ! git -C "$project_dir" check-ignore -q mise.local.toml; then
+  fail "machine-local Mise release configuration is not ignored"
+fi
+if git -C "$project_dir" check-ignore -q mise.local.example.toml; then
+  fail "the committed Mise local configuration example is ignored"
+fi
+if rg -q 'CLOUDFLARE_R2_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)|PASSWORD|AWS_ACCESS' \
+  "$project_dir/mise.local.example.toml"; then
+  fail "Mise local configuration example contains a credential field"
+fi
+python3 - "$project_dir/mise.local.example.toml" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data["env"]["APPLE_TEAM_ID"]["default"] == "TEAMID"
+assert data["env"]["CLOUDFLARE_R2_PUBLIC_BASE_URL"]["default"] == "https://updates.key.duckgoo.net"
+PY
+grep -qF 'raw = true' "$project_dir/mise.toml" \
+  || fail "release configuration task is not raw and cannot prompt reliably"
+
+# The complete environment pair wins without touching Keychain.
+(
+  export PATH="$project_dir/tests/fakes:$PATH"
+  export FAKE_SECURITY_DIR="$keychain_dir"
+  export FAKE_SECURITY_LOG="$keychain_log"
+  export CLOUDFLARE_R2_ACCESS_KEY_ID="environment-access-key"
+  export CLOUDFLARE_R2_SECRET_ACCESS_KEY="environment-secret-key"
+  source "$project_dir/scripts/release-keychain.sh"
+  duckgookey_resolve_r2_credentials
+  [[ "$DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID" == "environment-access-key" ]]
+  [[ "$DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY" == "environment-secret-key" ]]
+)
+[[ ! -s "$keychain_log" ]] \
+  || fail "complete environment credentials unexpectedly read Keychain"
+
+# A partial override must not be combined with one Keychain value.
+if (
+  export PATH="$project_dir/tests/fakes:$PATH"
+  export FAKE_SECURITY_DIR="$keychain_dir"
+  export FAKE_SECURITY_LOG="$keychain_log"
+  export CLOUDFLARE_R2_ACCESS_KEY_ID="environment-access-key"
+  unset CLOUDFLARE_R2_SECRET_ACCESS_KEY
+  source "$project_dir/scripts/release-keychain.sh"
+  duckgookey_resolve_r2_credentials
+); then
+  fail "partial environment credentials were accepted"
+fi
+[[ ! -s "$keychain_log" ]] \
+  || fail "partial environment credentials unexpectedly read Keychain"
+
+# A missing environment pair reads the two exact Keychain entries once.
+printf 'keychain-access-key' > "$keychain_dir/items/CLOUDFLARE_R2_ACCESS_KEY_ID"
+printf 'keychain-secret-key' > "$keychain_dir/items/CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+(
+  export PATH="$project_dir/tests/fakes:$PATH"
+  export FAKE_SECURITY_DIR="$keychain_dir"
+  export FAKE_SECURITY_LOG="$keychain_log"
+  unset CLOUDFLARE_R2_ACCESS_KEY_ID CLOUDFLARE_R2_SECRET_ACCESS_KEY
+  source "$project_dir/scripts/release-keychain.sh"
+  duckgookey_resolve_r2_credentials
+  [[ "$DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID" == "keychain-access-key" ]]
+  [[ "$DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY" == "keychain-secret-key" ]]
+)
+[[ "$(grep -c '^find com.duckgoo.key.release.r2 .* true$' "$keychain_log")" == "2" ]] \
+  || fail "Keychain fallback did not read exactly two credential items"
+
+rm "$keychain_dir/items/CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+if (
+  export PATH="$project_dir/tests/fakes:$PATH"
+  export FAKE_SECURITY_DIR="$keychain_dir"
+  export FAKE_SECURITY_LOG="$keychain_log"
+  unset CLOUDFLARE_R2_ACCESS_KEY_ID CLOUDFLARE_R2_SECRET_ACCESS_KEY
+  source "$project_dir/scripts/release-keychain.sh"
+  duckgookey_resolve_r2_credentials
+); then
+  fail "missing Keychain secret was accepted"
+fi
+printf 'keychain-secret-key' > "$keychain_dir/items/CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+
+configured_local_file="$temporary_dir/mise.local.toml"
+configure_output="$temporary_dir/release-configure.out"
+rm "$keychain_dir/items/CLOUDFLARE_R2_ACCESS_KEY_ID" \
+  "$keychain_dir/items/CLOUDFLARE_R2_SECRET_ACCESS_KEY"
+(
+  printf '\n\n\n\n\n\n\nfixture-access-key\nfixture-secret-key\n' \
+    | env \
+      PATH="$project_dir/tests/fakes:$PATH" \
+      FAKE_SECURITY_DIR="$keychain_dir" \
+      FAKE_SECURITY_LOG="$keychain_log" \
+      FAKE_SECURITY_IDENTITIES='Developer ID Application: DuckGooKey Test (ABCDE12345)' \
+      FAKE_MISE_LOG="$fake_mise_log" \
+      APPLE_SIGNING_IDENTITY='Developer ID Application: DuckGooKey Test (ABCDE12345)' \
+      APPLE_TEAM_ID='ABCDE12345' \
+      APPLE_KEYCHAIN_PROFILE='duckgookey-notary' \
+      CLOUDFLARE_R2_BUCKET='duckgookey-releases' \
+      CLOUDFLARE_R2_ENDPOINT='https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com' \
+      CLOUDFLARE_R2_PUBLIC_BASE_URL='https://updates.key.duckgoo.net' \
+      "$project_dir/scripts/release-configure.sh" \
+        --config "$configured_local_file"
+) > "$configure_output" 2>&1
+
+python3 - "$configured_local_file" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+env = data["env"]
+assert env["APPLE_SIGNING_IDENTITY"]["default"] == "Developer ID Application: DuckGooKey Test (ABCDE12345)"
+assert env["APPLE_TEAM_ID"]["default"] == "ABCDE12345"
+assert env["APPLE_KEYCHAIN_PROFILE"]["default"] == "duckgookey-notary"
+assert env["CLOUDFLARE_R2_BUCKET"]["default"] == "duckgookey-releases"
+assert env["CLOUDFLARE_R2_ENDPOINT"]["default"].startswith("https://0123456789abcdef")
+assert env["CLOUDFLARE_R2_PUBLIC_BASE_URL"]["default"] == "https://updates.key.duckgoo.net"
+assert "CLOUDFLARE_R2_ACCESS_KEY_ID" not in env
+assert "CLOUDFLARE_R2_SECRET_ACCESS_KEY" not in env
+PY
+[[ "$(cat "$keychain_dir/items/CLOUDFLARE_R2_ACCESS_KEY_ID")" == "fixture-access-key" ]] \
+  || fail "release configurator did not store the R2 access key via Keychain"
+[[ "$(cat "$keychain_dir/items/CLOUDFLARE_R2_SECRET_ACCESS_KEY")" == "fixture-secret-key" ]] \
+  || fail "release configurator did not store the R2 secret via Keychain"
+if rg -q 'fixture-(access|secret)-key' \
+  "$configure_output" "$configured_local_file" "$keychain_log" "$fake_mise_log"; then
+  fail "release configuration leaked a test credential outside fake Keychain state"
+fi
+grep -q '^add com.duckgoo.key.release.r2 CLOUDFLARE_R2_ACCESS_KEY_ID prompted$' "$keychain_log" \
+  || fail "release configurator did not use a prompted Keychain access key write"
+grep -q '^add com.duckgoo.key.release.r2 CLOUDFLARE_R2_SECRET_ACCESS_KEY prompted$' "$keychain_log" \
+  || fail "release configurator did not use a prompted Keychain secret write"
+grep -q '^install$' "$fake_mise_log" \
+  || fail "release configurator did not prepare the pinned AWS CLI for validation"
+grep -q '^aws$' "$fake_mise_log" \
+  || fail "release configurator did not validate access with the AWS CLI"
+grep -q '^trust$' "$fake_mise_log" \
+  || fail "release configurator did not trust its completed local Mise file"
+
+unmanaged_local_file="$temporary_dir/unmanaged.local.toml"
+printf '[env]\nUNRELATED = "value"\n' > "$unmanaged_local_file"
+if env \
+  PATH="$project_dir/tests/fakes:$PATH" \
+  FAKE_SECURITY_DIR="$keychain_dir" \
+  FAKE_SECURITY_LOG="$keychain_log" \
+  FAKE_SECURITY_IDENTITIES='Developer ID Application: DuckGooKey Test (ABCDE12345)' \
+  FAKE_MISE_LOG="$fake_mise_log" \
+  "$project_dir/scripts/release-configure.sh" \
+    --config "$unmanaged_local_file" \
+    --skip-r2-credentials </dev/null >/dev/null 2>&1; then
+  fail "release configurator replaced an unmanaged local Mise file"
+fi
+grep -q '^UNRELATED = "value"$' "$unmanaged_local_file" \
+  || fail "unmanaged local Mise file changed after refusal"
 
 grep -qF './scripts/package-macos-release-arch.sh' \
   "$project_dir/.github/workflows/release.yml" \
@@ -47,6 +209,8 @@ grep -qF 'package-macos-release-arch.sh' "$project_dir/scripts/release-local.sh"
   || fail "local release does not use the shared architecture packager"
 grep -qF 'publish-r2.sh' "$project_dir/scripts/release-local.sh" \
   || fail "local release cannot invoke the shared R2 publisher"
+grep -qF 'release-keychain.sh' "$project_dir/scripts/release-local.sh" \
+  || fail "local release does not use the shared Keychain credential resolver"
 if grep -Eq 'notarytool submit|codesign --verify' \
   "$project_dir/.github/workflows/release.yml"; then
   fail "GitHub workflow duplicates public packaging or notarization logic"

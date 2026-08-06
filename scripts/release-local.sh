@@ -27,13 +27,16 @@ Required public release environment:
   APPLE_KEYCHAIN_PROFILE              (default notary mode)
 
 Required only with --publish-r2:
-  CLOUDFLARE_R2_ACCESS_KEY_ID
-  CLOUDFLARE_R2_SECRET_ACCESS_KEY
   CLOUDFLARE_R2_BUCKET
   CLOUDFLARE_R2_ENDPOINT
 
 CLOUDFLARE_R2_PUBLIC_BASE_URL defaults to:
   https://updates.key.duckgoo.net
+
+R2 credentials are read from the default user Keychain by default. Set both
+CLOUDFLARE_R2_ACCESS_KEY_ID and CLOUDFLARE_R2_SECRET_ACCESS_KEY together for
+a one-run environment override. Run `mise run release-configure` to set up
+the Keychain and ignored local Mise settings.
 
 Use --reuse-artifacts after an upload failure to retry the preserved bytes.
 Rebuilding the same notarized version can produce different immutable bytes.
@@ -115,6 +118,17 @@ while (( $# > 0 )); do
   esac
 done
 
+# Preserve a possible one-run credential pair as unexported shell values as
+# soon as parsing is complete. This prevents even early tool probes from
+# inheriting the Cloudflare-specific names.
+r2_env_access_key_id=""
+r2_env_secret_access_key=""
+if [[ "$publish_r2" == "true" ]]; then
+  r2_env_access_key_id="${CLOUDFLARE_R2_ACCESS_KEY_ID:-}"
+  r2_env_secret_access_key="${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}"
+  unset CLOUDFLARE_R2_ACCESS_KEY_ID CLOUDFLARE_R2_SECRET_ACCESS_KEY
+fi
+
 [[ -n "$tag" ]] || usage_error "--tag is required"
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   usage_error "tag must be SemVer beginning with v"
@@ -149,7 +163,32 @@ command -v mise >/dev/null 2>&1 \
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=release-keychain.sh
+source "$script_dir/release-keychain.sh"
 cd "$project_dir"
+
+# A parent shell may provide a one-run R2 override. Resolve it before any git,
+# mise, or packaging subprocess can inherit it, then retain it only in this
+# shell until it is mapped to AWS_* for the two R2 operations.
+if [[ "$publish_r2" == "true" ]]; then
+  missing=()
+  [[ -n "${CLOUDFLARE_R2_BUCKET:-}" ]] || missing+=("CLOUDFLARE_R2_BUCKET")
+  [[ -n "${CLOUDFLARE_R2_ENDPOINT:-}" ]] || missing+=("CLOUDFLARE_R2_ENDPOINT")
+  if (( ${#missing[@]} > 0 )); then
+    printf -v missing_list '%s, ' "${missing[@]}"
+    die "R2 publication is missing ${missing_list%, }"
+  fi
+
+  set +x
+  duckgookey_resolve_r2_credentials_from_values \
+    "$r2_env_access_key_id" \
+    "$r2_env_secret_access_key" \
+    || die "$DUCKGOOKEY_R2_CREDENTIAL_ERROR"
+  r2_env_access_key_id=""
+  r2_env_secret_access_key=""
+  export -n DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID \
+    DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY 2>/dev/null || true
+fi
 
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
   die "the working tree must be clean for a public release"
@@ -223,21 +262,11 @@ verify_remote_release_tag() {
 }
 
 if [[ "$publish_r2" == "true" ]]; then
-  missing=()
-  [[ -n "${CLOUDFLARE_R2_ACCESS_KEY_ID:-}" ]] || missing+=("CLOUDFLARE_R2_ACCESS_KEY_ID")
-  [[ -n "${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}" ]] || missing+=("CLOUDFLARE_R2_SECRET_ACCESS_KEY")
-  [[ -n "${CLOUDFLARE_R2_BUCKET:-}" ]] || missing+=("CLOUDFLARE_R2_BUCKET")
-  [[ -n "${CLOUDFLARE_R2_ENDPOINT:-}" ]] || missing+=("CLOUDFLARE_R2_ENDPOINT")
-  if (( ${#missing[@]} > 0 )); then
-    printf -v missing_list '%s, ' "${missing[@]}"
-    die "R2 publication is missing ${missing_list%, }"
-  fi
-
   verify_remote_release_tag
 
   printf 'Checking R2 access before building release artifacts...\n'
-  AWS_ACCESS_KEY_ID="$CLOUDFLARE_R2_ACCESS_KEY_ID" \
-  AWS_SECRET_ACCESS_KEY="$CLOUDFLARE_R2_SECRET_ACCESS_KEY" \
+  AWS_ACCESS_KEY_ID="$DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID" \
+  AWS_SECRET_ACCESS_KEY="$DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY" \
   AWS_DEFAULT_REGION=auto \
   AWS_EC2_METADATA_DISABLED=true \
   MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false \
@@ -390,8 +419,8 @@ if [[ "$publish_r2" == "true" ]]; then
   verify_remote_release_tag
 
   printf 'Publishing DuckGooKey %s to R2...\n' "$tag"
-  AWS_ACCESS_KEY_ID="$CLOUDFLARE_R2_ACCESS_KEY_ID" \
-  AWS_SECRET_ACCESS_KEY="$CLOUDFLARE_R2_SECRET_ACCESS_KEY" \
+  AWS_ACCESS_KEY_ID="$DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID" \
+  AWS_SECRET_ACCESS_KEY="$DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY" \
   AWS_DEFAULT_REGION=auto \
   AWS_EC2_METADATA_DISABLED=true \
   MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false \
@@ -402,6 +431,9 @@ if [[ "$publish_r2" == "true" ]]; then
       --base-url "$base_url" \
       --artifacts-dir "$output_dir" \
       --manifest "$output_dir/latest.json"
+
+  DUCKGOOKEY_RESOLVED_R2_ACCESS_KEY_ID=""
+  DUCKGOOKEY_RESOLVED_R2_SECRET_ACCESS_KEY=""
 fi
 
 printf '\nPublic release is ready:\n'

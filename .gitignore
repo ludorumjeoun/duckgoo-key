@@ -5,6 +5,9 @@
 *.log
 release-manifest.json
 
+# Machine-local release settings; secrets live in macOS Keychain.
+/mise.local.toml
+
 # Signing private keys and temporary keychains must never enter the repository.
 *.key
 *.key.pem

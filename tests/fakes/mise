@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FAKE_MISE_LOG:?FAKE_MISE_LOG is required}"
+
+case "${1-}" in
+  install)
+    printf 'install\n' >> "$FAKE_MISE_LOG"
+    ;;
+  trust)
+    printf 'trust\n' >> "$FAKE_MISE_LOG"
+    ;;
+  exec)
+    shift
+    [[ "${1-}" == "--" ]] || exit 64
+    shift
+    [[ "${1-}" == "aws" ]] || exit 64
+    [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] || exit 1
+    printf 'aws\n' >> "$FAKE_MISE_LOG"
+    printf '{}\n'
+    ;;
+  *)
+    exit 64
+    ;;
+esac

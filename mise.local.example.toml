@@ -1,0 +1,10 @@
+# Copy to mise.local.toml or run `mise run release-configure`.
+# R2 access keys belong in the macOS Keychain, never in this file.
+
+[env]
+APPLE_SIGNING_IDENTITY = { default = "Developer ID Application: Legal Name (TEAMID)" }
+APPLE_TEAM_ID = { default = "TEAMID" }
+APPLE_KEYCHAIN_PROFILE = { default = "duckgookey-notary" }
+CLOUDFLARE_R2_BUCKET = { default = "duckgookey-releases" }
+CLOUDFLARE_R2_ENDPOINT = { default = "https://ACCOUNT_ID.r2.cloudflarestorage.com" }
+CLOUDFLARE_R2_PUBLIC_BASE_URL = { default = "https://updates.key.duckgoo.net" }

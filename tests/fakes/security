@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${FAKE_SECURITY_DIR:?FAKE_SECURITY_DIR is required}"
+: "${FAKE_SECURITY_LOG:?FAKE_SECURITY_LOG is required}"
+
+items_dir="$FAKE_SECURITY_DIR/items"
+mkdir -p "$items_dir"
+
+log() {
+  printf '%s\n' "$*" >> "$FAKE_SECURITY_LOG"
+}
+
+require_value() {
+  [[ -n "${2-}" ]] || exit 64
+}
+
+case "${1-}" in
+  default-keychain)
+    log "default-keychain"
+    printf '"%s/login.keychain-db"\n' "$FAKE_SECURITY_DIR"
+    ;;
+  find-identity)
+    log "find-identity"
+    if [[ -n "${FAKE_SECURITY_IDENTITIES:-}" ]]; then
+      printf '  1) FAKEIDENTITY "%s"\n' "$FAKE_SECURITY_IDENTITIES"
+    else
+      printf '     0 valid identities found\n'
+    fi
+    ;;
+  add-generic-password)
+    shift
+    account=""
+    service=""
+    prompted="false"
+    while (( $# > 0 )); do
+      case "$1" in
+        -U)
+          shift
+          ;;
+        -a|-s|-D|-l|-j)
+          require_value "$1" "${2-}"
+          case "$1" in
+            -a) account="$2" ;;
+            -s) service="$2" ;;
+          esac
+          shift 2
+          ;;
+        -w)
+          (( $# == 1 )) || exit 64
+          prompted="true"
+          shift
+          ;;
+        *)
+          exit 64
+          ;;
+      esac
+    done
+    [[ -n "$account" && -n "$service" && "$prompted" == "true" ]] || exit 64
+    [[ "${FAKE_SECURITY_FAIL_ADD_ACCOUNT:-}" != "$account" ]] || exit 1
+    password=""
+    IFS= read -r password || exit 1
+    printf '%s' "$password" > "$items_dir/$account"
+    log "add $service $account prompted"
+    ;;
+  find-generic-password)
+    shift
+    account=""
+    service=""
+    reveal="false"
+    while (( $# > 0 )); do
+      case "$1" in
+        -a|-s)
+          require_value "$1" "${2-}"
+          case "$1" in
+            -a) account="$2" ;;
+            -s) service="$2" ;;
+          esac
+          shift 2
+          ;;
+        -w)
+          reveal="true"
+          shift
+          ;;
+        *)
+          # The default Keychain path is a positional final argument.
+          shift
+          ;;
+      esac
+    done
+    [[ -n "$account" && -n "$service" ]] || exit 64
+    [[ "${FAKE_SECURITY_FAIL_FIND_ACCOUNT:-}" != "$account" ]] || exit 1
+    [[ -f "$items_dir/$account" ]] || exit 44
+    log "find $service $account $reveal"
+    if [[ "$reveal" == "true" ]]; then
+      cat "$items_dir/$account"
+    fi
+    ;;
+  delete-generic-password)
+    shift
+    account=""
+    service=""
+    while (( $# > 0 )); do
+      case "$1" in
+        -a|-s)
+          require_value "$1" "${2-}"
+          case "$1" in
+            -a) account="$2" ;;
+            -s) service="$2" ;;
+          esac
+          shift 2
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    [[ -n "$account" && -n "$service" ]] || exit 64
+    rm -f "$items_dir/$account"
+    log "delete $service $account"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
