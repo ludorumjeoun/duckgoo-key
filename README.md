@@ -235,12 +235,14 @@ The main development tasks are:
 
 ## Release
 
-Push a SemVer tag matching `Cargo.toml`, such as `v0.1.0`. The release workflow
-builds separate Apple Silicon and Intel packages, verifies their architecture
-and checksums, and always retains GitHub Actions artifacts. Public R2
-publication requires complete Developer ID signing and Apple notarization;
-missing or partial Apple/R2 configuration fails instead of publishing an
-unsigned fallback.
+Push a SemVer tag matching `Cargo.toml`, such as `v0.1.0`, for the local public
+release track. The GitHub **Release** workflow is manual-only: it remains
+available from Actions when its signing configuration is ready, but tag pushes
+do not start it. That workflow builds separate Apple Silicon and Intel
+packages, verifies their architecture and checksums, and retains GitHub Actions
+artifacts. Public R2 publication requires complete Developer ID signing and
+Apple notarization; missing or partial Apple/R2 configuration fails instead of
+publishing an unsigned fallback.
 
 For pre-account private testing, the separate **Private Release** workflow uses
 a pinned self-signed certificate, includes the public certificate and

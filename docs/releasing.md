@@ -109,9 +109,12 @@ requires a clean `main` worktree and refuses existing local or remote tags.
    git push origin v0.1.0
    ```
 
-Any pushed `v*` tag starts the public workflow in **build and verify only**
-mode. It does not mutate R2. Invalid tags, version mismatches, incomplete
-Developer ID configuration, or failed notarization fail the run.
+Pushing a `v*` tag does not start GitHub Actions. The **Release** workflow is
+manual-only, so the local release track can publish without GitHub Actions
+attempting a second build. When the GitHub signing configuration is ready, run
+**Actions → Release → Run workflow** with the matching tag. Invalid tags,
+version mismatches, incomplete Developer ID configuration, or failed
+notarization fail that manual run.
 
 ### Local public release
 
