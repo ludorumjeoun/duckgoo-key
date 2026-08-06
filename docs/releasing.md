@@ -92,8 +92,8 @@ Run the interactive local setup task next:
 mise run release-configure
 ```
 
-It validates the installed Developer ID identity, writes the six non-secret
-settings to the ignored `mise.local.toml`, stores the two R2 S3 credentials in
+It records the Developer ID identity, writes the six non-secret settings to the
+ignored `mise.local.toml`, stores the two R2 S3 credentials in
 the default user Keychain, verifies R2 bucket access, then trusts the completed
 local Mise file. The generated values use Mise's `default` form, so shell
 environment values still win for one run. No R2 access key, secret key, Apple
@@ -230,10 +230,11 @@ The local command can also use a base64 P12 by passing
 `--signing-source p12-env`, but the installed keychain identity is preferred.
 
 `mise run release-configure` records the local identity, Team ID, and profile
-name only after confirming that the selected Developer ID Application identity
-is installed. It intentionally does not inspect Apple's private notarytool
-Keychain schema; create or update that profile with `xcrun notarytool
-store-credentials`.
+name. It reports a warning when its task shell cannot see the selected
+Developer ID identity; the release packager performs the final signing identity
+verification before distribution. The setup task intentionally does not inspect
+Apple's private notarytool Keychain schema; create or update that profile with
+`xcrun notarytool store-credentials`.
 
 In GitHub, `cargo-packager` imports the P12 into a temporary keychain. Locally,
 it uses the selected installed identity. In both tracks it enables the hardened
