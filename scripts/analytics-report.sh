@@ -8,9 +8,9 @@ source "$script_dir/analytics-keychain.sh"
 
 period="${1:-weekly}"
 case "$period" in
-  daily) interval="1 DAY" ;;
-  weekly) interval="7 DAY" ;;
-  monthly) interval="30 DAY" ;;
+  daily) interval_value="1" ;;
+  weekly) interval_value="7" ;;
+  monthly) interval_value="30" ;;
   *)
     printf 'usage: analytics-report.sh [daily|weekly|monthly]\n' >&2
     exit 2
@@ -31,8 +31,8 @@ query() {
     --data-binary "$1"
 }
 
-event_query="SELECT blob1 AS event, blob2 AS platform, blob3 AS version, SUM(_sample_interval) AS count FROM duckgookey_events WHERE timestamp > NOW() - INTERVAL '$interval' GROUP BY event, platform, version ORDER BY count DESC FORMAT JSON"
-active_query="SELECT COUNT(DISTINCT index1) AS active_installations FROM duckgookey_events WHERE timestamp > NOW() - INTERVAL '$interval' AND blob1 = 'active_daily' FORMAT JSON"
+event_query="SELECT blob1 AS event, blob2 AS platform, blob3 AS version, SUM(_sample_interval) AS count FROM duckgookey_events WHERE timestamp > NOW() - INTERVAL '$interval_value' DAY GROUP BY event, platform, version ORDER BY count DESC FORMAT JSON"
+active_query="SELECT COUNT(DISTINCT index1) AS active_installations FROM duckgookey_events WHERE timestamp > NOW() - INTERVAL '$interval_value' DAY AND blob1 = 'active_daily' FORMAT JSON"
 
 printf 'DuckGooKey anonymous usage report · %s\n\n' "$period"
 printf 'Event totals\n'
