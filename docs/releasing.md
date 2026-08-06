@@ -25,7 +25,8 @@ DuckGooKey has two intentionally separate distribution channels:
   architecture.
 - The `.app` is preserved as a resource-safe `.app.zip` for download.
 - Every architecture artifact includes a `SHA256SUMS` file.
-- The release manifest advertises the DMG for each platform.
+- The release manifest advertises the DMG and the corresponding signed
+  `.app.zip` for each platform. The ZIP is the in-place updater payload.
 - The packaged app sets `LSUIElement` through `backgroundApp`, so the
   menu-bar launcher does not add a Dock icon.
 - Public R2 artifacts must be signed with `Developer ID Application`, have the
@@ -378,12 +379,20 @@ otherwise publishing fails instead of overwriting history. New versioned
 objects are created with `If-None-Match: *`, so concurrent runs cannot overwrite
 one another between the existence check and upload.
 
-Before advertising a release, the publisher downloads both DMGs and
-`release.json` through the public custom domain and requires byte-for-byte
-matches. `latest.json` is the only mutable object. It is written last using an
-ETag condition, rejects SemVer rollback, and rejects different data for an
-already published version. The publisher finally downloads `latest.json`
-through the custom domain and compares it with the local manifest.
+Before advertising a release, the publisher downloads both DMGs, both app ZIP
+archives, and `release.json` through the public custom domain and requires
+byte-for-byte matches. `latest.json` is the only mutable object. It is written
+last using an ETag condition, rejects SemVer rollback, and rejects different
+data for an already published version. The publisher finally downloads
+`latest.json` through the custom domain and compares it with the local
+manifest.
+
+Installed DuckGooKey versions that include the updater check `latest.json` on
+launch and then every six hours by default. They never download or replace the
+app without the user choosing **Install** in Settings. Before replacement, the
+app ZIP SHA-256, the expanded bundle's codesign signature, Gatekeeper
+assessment, and Apple Developer Team ID must all match. Private/self-signed
+packages are intentionally not valid update sources for the public channel.
 
 The manifest schema is:
 
@@ -394,11 +403,15 @@ The manifest schema is:
   "platforms": {
     "macos-aarch64": {
       "url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-aarch64.dmg",
-      "sha256": "64 lowercase hexadecimal characters"
+      "sha256": "64 lowercase hexadecimal characters",
+      "app_url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-aarch64.app.zip",
+      "app_sha256": "64 lowercase hexadecimal characters"
     },
     "macos-x86_64": {
       "url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-x86_64.dmg",
-      "sha256": "64 lowercase hexadecimal characters"
+      "sha256": "64 lowercase hexadecimal characters",
+      "app_url": "https://updates.key.duckgoo.net/releases/v0.1.0/DuckGooKey-0.1.0-macos-x86_64.app.zip",
+      "app_sha256": "64 lowercase hexadecimal characters"
     }
   }
 }

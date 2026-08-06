@@ -34,6 +34,7 @@ reproducible Cloudflare R2 delivery path.
 - Apple Silicon and Intel `.app`/`.dmg` release jobs
 - Developer ID-signed, Apple-notarized public releases on immutable Cloudflare
   R2 objects with a checksummed `latest.json`
+- User-approved automatic updates with SHA-256 and Apple-signing verification
 - Separately isolated self-signed packages for private testers
 
 ## Requirements
@@ -243,7 +244,9 @@ For pre-account private testing, the separate **Private Release** workflow uses
 a pinned self-signed certificate, includes the public certificate and
 fingerprint, and keeps the result in short-lived GitHub artifacts rather than
 the public R2 bucket. Versioned R2 objects are never overwritten; `latest.json`
-is updated last so it cannot advertise a partial release.
+is updated last so it cannot advertise a partial release. Starting with the
+first version that contains the updater, installed apps check this manifest
+automatically and offer a verified in-place update.
 
 See [docs/releasing.md](docs/releasing.md) for signing, notarization, R2
 configuration, object layout, and local script usage.
