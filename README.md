@@ -227,6 +227,8 @@ The main development tasks are:
 | `mise run check` | Check formatting, run all tests and Clippy, and make a release build |
 | `mise run package` | Build the release `.app` and DMG, then open the output folder |
 | `mise run package -- --no-open` | Build the same packages without opening Finder |
+| `mise run release-configure` | Store local release settings and R2 credentials securely in Keychain |
+| `mise run release-local -- --tag v0.1.0` | Build the signed, notarized local public release without publishing |
 
 ## Release
 

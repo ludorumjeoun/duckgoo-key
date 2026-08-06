@@ -32,7 +32,9 @@ DuckGooKey has two intentionally separate distribution channels:
   hardened runtime enabled, and have accepted Apple notarization tickets
   stapled to both the app and final DMG.
 - A public publication request fails when any Apple or R2 setting is missing or
-  only partially configured. It never silently falls back to an unsigned file.
+  only partially configured. Locally, the R2 credential pair is read from
+  Keychain unless a complete one-run environment override is supplied. It
+  never silently falls back to an unsigned file.
 - Unsigned output is permitted only when a manual **Release** run explicitly
   disables R2. Its artifact name contains `UNSIGNED-NOT-FOR-DISTRIBUTION`.
 - Private-signed output has `Private` in every filename, includes the public
@@ -74,27 +76,58 @@ The local track performs the full two-architecture release on a Mac. It
 requires a clean working tree, `HEAD` at the matching tag, a Developer ID
 Application identity, and Apple notarization credentials. The default command
 builds, signs, notarizes, verifies, writes `latest.json`, and opens the artifact
-folder without changing R2:
+folder without changing R2.
+
+For the first release on a Mac, install the Developer ID Application
+certificate and private key in the default user Keychain, then store the Apple
+notarization profile once:
 
 ```bash
-export APPLE_SIGNING_IDENTITY='Developer ID Application: Legal Name (TEAMID)'
-export APPLE_TEAM_ID='TEAMID'
-export APPLE_KEYCHAIN_PROFILE='duckgookey-notary'
+xcrun notarytool store-credentials "duckgookey-notary"
+```
 
+Run the interactive local setup task next:
+
+```bash
+mise run release-configure
+```
+
+It validates the installed Developer ID identity, writes the six non-secret
+settings to the ignored `mise.local.toml`, stores the two R2 S3 credentials in
+the default user Keychain, verifies R2 bucket access, then trusts the completed
+local Mise file. The generated values use Mise's `default` form, so shell
+environment values still win for one run. No R2 access key, secret key, Apple
+password, or P12 is written to the repository or local TOML file.
+
+The normal local release command is then:
+
+```bash
 mise run release-local -- --tag v0.1.0
 ```
 
 Add `--publish-r2` only when this machine should publish the release:
 
 ```bash
-export CLOUDFLARE_R2_ACCESS_KEY_ID='...'
-export CLOUDFLARE_R2_SECRET_ACCESS_KEY='...'
-export CLOUDFLARE_R2_BUCKET='duckgookey-releases'
-export CLOUDFLARE_R2_ENDPOINT='https://ACCOUNT_ID.r2.cloudflarestorage.com'
-export CLOUDFLARE_R2_PUBLIC_BASE_URL='https://updates.key.duckgoo.net'
-
 mise run release-local -- --tag v0.1.0 --publish-r2
 ```
+
+For a single automation run, set both R2 credential environment variables
+together. This pair has priority over Keychain; supplying only one is rejected
+and never mixes an environment value with a Keychain value. The release script
+captures that pair immediately, removes the `CLOUDFLARE_R2_*` names from its
+environment, and passes the values only to its AWS CLI subprocesses as
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+```bash
+CLOUDFLARE_R2_ACCESS_KEY_ID='...' \
+CLOUDFLARE_R2_SECRET_ACCESS_KEY='...' \
+mise run release-local -- --tag v0.1.0 --publish-r2
+```
+
+`mise run release-configure -- --skip-r2-credentials` is useful to set up the
+Apple and non-secret R2 values before the R2 API token exists. Use
+`--skip-r2-check` only when an offline setup prevents the normal bucket-access
+validation.
 
 Publication additionally requires the same tag on `origin` at the release
 commit. If R2 or CDN verification fails after packaging, the exact signed bytes
@@ -196,6 +229,12 @@ provide `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` in the environment.
 The local command can also use a base64 P12 by passing
 `--signing-source p12-env`, but the installed keychain identity is preferred.
 
+`mise run release-configure` records the local identity, Team ID, and profile
+name only after confirming that the selected Developer ID Application identity
+is installed. It intentionally does not inspect Apple's private notarytool
+Keychain schema; create or update that profile with `xcrun notarytool
+store-credentials`.
+
 In GitHub, `cargo-packager` imports the P12 into a temporary keychain. Locally,
 it uses the selected installed identity. In both tracks it enables the hardened
 runtime, signs the app and DMG, submits the app through `notarytool`, and staples
@@ -275,14 +314,21 @@ through MDM. Never give testers the P12 or its password.
 
 ## Cloudflare R2 configuration
 
-R2 publishing needs two secrets:
+R2 publishing needs two secrets. In GitHub, configure these as repository or
+environment **secrets**. On a local release Mac, `mise run release-configure`
+stores the same values as two generic-password items in the default user
+Keychain under service `com.duckgoo.key.release.r2`; they are never put in
+`mise.local.toml`.
 
 | Secret | Purpose |
 | --- | --- |
 | `CLOUDFLARE_R2_ACCESS_KEY_ID` | R2 S3 API token access key |
 | `CLOUDFLARE_R2_SECRET_ACCESS_KEY` | R2 S3 API token secret key |
 
-It also needs three non-sensitive repository variables:
+It also needs three non-sensitive repository variables. In GitHub, configure
+them as repository or environment variables. Locally, the setup task writes
+them as ignored `mise.local.toml` defaults; see
+[`mise.local.example.toml`](../mise.local.example.toml) for the exact shape.
 
 | Variable | Example |
 | --- | --- |
@@ -305,6 +351,9 @@ Cloudflare references:
 When R2 publication is requested, any missing credential or variable fails the
 workflow. Tag pushes never publish. A GitHub manual run publishes only with
 `publish_r2=true`, and the local track publishes only with `--publish-r2`.
+For direct use of `publish-r2.sh`, keep using temporary `AWS_*` environment
+credentials; that low-level utility intentionally bypasses the local Keychain
+wrapper.
 
 ## R2 object layout and immutability
 
