@@ -30,6 +30,9 @@ pub struct AppSettings {
     /// Update checks are enabled by default, including for existing settings files.
     #[serde(default = "default_update_checks_enabled")]
     pub update_checks_enabled: bool,
+    /// Anonymous release telemetry is sent only after the user opts in.
+    #[serde(default)]
+    pub anonymous_usage_stats_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -39,6 +42,7 @@ impl Default for AppSettings {
             preferred_input_source: None,
             clipboard_history_enabled: false,
             update_checks_enabled: default_update_checks_enabled(),
+            anonymous_usage_stats_enabled: false,
         }
     }
 }
@@ -59,6 +63,12 @@ pub struct StoreData {
     pub clipboard_history: ClipboardHistory,
     #[serde(default = "default_next_clipboard_entry_id")]
     pub next_clipboard_entry_id: u64,
+    /// Opaque random ID used only when anonymous usage statistics are enabled.
+    #[serde(default)]
+    pub telemetry_installation_id: Option<String>,
+    /// UTC day when the last daily activity event was scheduled.
+    #[serde(default)]
+    pub telemetry_last_active_day: Option<u64>,
 }
 
 impl Default for StoreData {
@@ -71,6 +81,8 @@ impl Default for StoreData {
             next_quick_link_id: default_next_quick_link_id(),
             clipboard_history: ClipboardHistory::default(),
             next_clipboard_entry_id: default_next_clipboard_entry_id(),
+            telemetry_installation_id: None,
+            telemetry_last_active_day: None,
         }
     }
 }

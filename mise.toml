@@ -49,6 +49,16 @@ run = "./scripts/release-local.sh"
 description = "Bump version, validate, commit, tag, and optionally push a public release"
 run = "./scripts/release-prepare.sh"
 
+[tasks.analytics-configure]
+description = "Store the read-only Cloudflare Analytics API token in the local Keychain"
+raw = true
+run = "./scripts/analytics-configure.sh"
+
+[tasks.analytics-report]
+description = "Print a daily, weekly, or monthly anonymous usage report"
+raw = true
+run = "./scripts/analytics-report.sh"
+
 [tasks.icons]
 description = "Rebuild the brand icon assets from a source image"
 run = '''

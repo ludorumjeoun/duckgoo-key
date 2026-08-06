@@ -251,6 +251,11 @@ automatically and offer a verified in-place update.
 See [docs/releasing.md](docs/releasing.md) for signing, notarization, R2
 configuration, object layout, and local script usage.
 
+## Anonymous release metrics
+
+Cloudflare-only anonymous release tracking and the on-demand report commands
+are documented in [docs/analytics.md](docs/analytics.md).
+
 ## Architecture
 
 ```text
@@ -264,6 +269,7 @@ Iced launcher UI
   ├── shortcut: validated, persisted global shortcut model
   ├── store: atomic persisted settings and usage state
   ├── integrations: global shortcut and menu bar events
+  ├── telemetry: opt-in anonymous release signals only
   └── platform
       ├── macOS: bundle/Spotlight discovery, clipboard, system commands,
       │          /usr/bin/open, and LaunchAgent

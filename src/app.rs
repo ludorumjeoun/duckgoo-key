@@ -25,6 +25,7 @@ use crate::platform;
 use crate::quick_link::QuickLink;
 use crate::shortcut::ShortcutBinding;
 use crate::store::{Store, StoreData};
+use crate::telemetry;
 use crate::updater;
 use crate::web_search;
 
@@ -230,6 +231,7 @@ enum Message {
     RequestDeleteQuickLink(u64),
     CancelQuickLinkEdit,
     SetClipboardHistoryEnabled(bool),
+    SetAnonymousUsageStatsEnabled(bool),
     SetUpdateChecksEnabled(bool),
     CheckForUpdates,
     UpdateCheckTick,
@@ -276,6 +278,10 @@ enum Message {
         enabled: bool,
         result: Result<(), String>,
     },
+    TelemetryFinished {
+        event: telemetry::Event,
+        result: Result<(), String>,
+    },
     PollNativeEvents,
 }
 
@@ -305,7 +311,21 @@ fn boot() -> (Launcher, Task<Message>) {
     let query_input = widget::Id::unique();
     let quick_link_title_input = widget::Id::unique();
     let quick_link_url_input = widget::Id::unique();
-    let (store, store_data, notice) = load_store();
+    let (store, mut store_data, mut notice) = load_store();
+    let mut telemetry_events = schedule_startup_telemetry(&mut store_data);
+    if !telemetry_events.is_empty() {
+        let saved = store
+            .as_ref()
+            .is_some_and(|store| store.save(&store_data).is_ok());
+        if !saved {
+            telemetry_events.clear();
+            if notice.is_none() {
+                notice = Some(Notice::error(
+                    "Anonymous usage statistics could not be prepared because local settings are unavailable",
+                ));
+            }
+        }
+    }
     let update_checks_enabled = store_data.settings.update_checks_enabled;
     let (input_sources, input_source_error) = load_input_sources();
     let (clipboard_change_count, clipboard_error) = if store_data.settings.clipboard_history_enabled
@@ -406,6 +426,7 @@ fn boot() -> (Launcher, Task<Message>) {
             } else {
                 Task::none()
             },
+            telemetry_tasks(telemetry_events),
         ]),
     )
 }
@@ -569,6 +590,9 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         Message::SetClipboardHistoryEnabled(enabled) => {
             set_clipboard_history_enabled(state, enabled);
             Task::none()
+        }
+        Message::SetAnonymousUsageStatsEnabled(enabled) => {
+            set_anonymous_usage_stats_enabled(state, enabled)
         }
         Message::SetUpdateChecksEnabled(enabled) => {
             set_update_checks_enabled(state, enabled);
@@ -845,6 +869,12 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
                         "Launch at login could not be changed: {error}"
                     )));
                 }
+            }
+            Task::none()
+        }
+        Message::TelemetryFinished { event, result } => {
+            if let Err(error) = result {
+                tracing::debug!(event = event.as_str(), error = %error, "Anonymous usage event was not sent");
             }
             Task::none()
         }
@@ -1447,6 +1477,70 @@ fn set_update_checks_enabled(state: &mut Launcher, enabled: bool) {
     } else {
         "Automatic update checks disabled"
     }));
+}
+
+fn set_anonymous_usage_stats_enabled(state: &mut Launcher, enabled: bool) -> Task<Message> {
+    if state.store_data.settings.anonymous_usage_stats_enabled == enabled {
+        return Task::none();
+    }
+
+    let mut candidate = state.store_data.clone();
+    candidate.settings.anonymous_usage_stats_enabled = enabled;
+    let events = if enabled {
+        schedule_startup_telemetry(&mut candidate)
+    } else {
+        candidate.telemetry_installation_id = None;
+        candidate.telemetry_last_active_day = None;
+        Vec::new()
+    };
+
+    if save_candidate(state, &candidate).is_err() {
+        return Task::none();
+    }
+
+    state.store_data = candidate;
+    state.notice = Some(Notice::info(if enabled {
+        "Anonymous usage statistics enabled · searches, apps, files, and clipboard content stay private"
+    } else {
+        "Anonymous usage statistics disabled"
+    }));
+    telemetry_tasks(events)
+}
+
+fn schedule_startup_telemetry(data: &mut StoreData) -> Vec<(telemetry::Event, String)> {
+    if !data.settings.anonymous_usage_stats_enabled {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    let installation_id = match data.telemetry_installation_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => {
+            let id = telemetry::new_installation_id();
+            data.telemetry_installation_id = Some(id.clone());
+            events.push((telemetry::Event::FirstLaunch, id.clone()));
+            id
+        }
+    };
+    let day = telemetry::current_day();
+    if data.telemetry_last_active_day != Some(day) {
+        data.telemetry_last_active_day = Some(day);
+        events.push((telemetry::Event::ActiveDaily, installation_id));
+    }
+    events
+}
+
+fn telemetry_tasks(events: Vec<(telemetry::Event, String)>) -> Task<Message> {
+    Task::batch(events.into_iter().map(|(event, installation_id)| {
+        Task::perform(
+            async move {
+                telemetry::send(event, installation_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            move |result| Message::TelemetryFinished { event, result },
+        )
+    }))
 }
 
 fn check_for_updates(manual: bool) -> Task<Message> {
@@ -2230,6 +2324,29 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     .width(Fill)
     .style(settings_card_style);
 
+    let anonymous_usage_stats_card = container(
+        iced::widget::row![
+            iced::widget::column![
+                text("Anonymous usage stats").size(14).color(TEXT_PRIMARY),
+                text(
+                    "First launch and one daily activity signal · never sends searches, apps, files, or clipboard content"
+                )
+                .size(11)
+                .color(TEXT_SECONDARY),
+            ]
+            .spacing(4)
+            .width(Fill),
+            toggler(state.store_data.settings.anonymous_usage_stats_enabled)
+                .on_toggle(Message::SetAnonymousUsageStatsEnabled)
+                .size(22),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding(15)
+    .width(Fill)
+    .style(settings_card_style);
+
     let quick_link_count = state.store_data.quick_links.len();
     let quick_links_card = container(
         iced::widget::row![
@@ -2403,6 +2520,7 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
         text("FEATURES").size(10).color(TEXT_SECONDARY),
         quick_links_card,
         clipboard_card,
+        anonymous_usage_stats_card,
         text("CATALOG").size(10).color(TEXT_SECONDARY),
         discovery_card,
     ]
@@ -3594,5 +3712,20 @@ mod tests {
             selected.identifier.as_deref(),
             Some("com.apple.keylayout.ABC")
         );
+    }
+
+    #[test]
+    fn startup_telemetry_requires_opt_in_and_is_daily() {
+        let mut data = StoreData::default();
+        assert!(schedule_startup_telemetry(&mut data).is_empty());
+        assert!(data.telemetry_installation_id.is_none());
+
+        data.settings.anonymous_usage_stats_enabled = true;
+        let events = schedule_startup_telemetry(&mut data);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, telemetry::Event::FirstLaunch);
+        assert_eq!(events[1].0, telemetry::Event::ActiveDaily);
+        assert!(data.telemetry_installation_id.is_some());
+        assert!(schedule_startup_telemetry(&mut data).is_empty());
     }
 }
