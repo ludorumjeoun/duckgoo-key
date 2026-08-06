@@ -57,6 +57,46 @@ Do not start both publishers for the same tag. Signed and notarized packages
 contain timestamps and tickets, so two builds of one version are not expected
 to be byte-identical.
 
+### Command map
+
+Use the high-level commands below; they preserve the required ordering and keep
+R2 secrets in the local Keychain.
+
+| Command | Purpose | Changes R2? |
+| --- | --- | --- |
+| `mise run check` | Format, test, lint, release-build, and release-policy validation | No |
+| `mise run release-configure` | One-time local Apple/notary/R2 configuration and bucket access check | No |
+| `mise run release-local -- --tag vX.Y.Z --no-open` | Sign, notarize, staple, and stage both architectures locally | No |
+| `mise run release-local -- --tag vX.Y.Z --publish-r2 --reuse-artifacts --no-open` | Publish the already verified staged bytes and advance `latest.json` | Yes |
+
+### Public release process
+
+For each public version, use this sequence. Replace `v0.1.1` with the intended
+version when preparing a later release.
+
+```bash
+# 1. Validate the release commit, then make the immutable release reference.
+mise run check
+git status --short
+git tag -a v0.1.1 -m "DuckGooKey v0.1.1"
+git push origin main v0.1.1
+
+# 2. Produce signed and notarized artifacts without changing R2.
+mise run release-local -- --tag v0.1.1 --no-open
+
+# 3. Publish exactly those staged bytes after reviewing the local artifacts.
+mise run release-local -- \
+  --tag v0.1.1 \
+  --publish-r2 \
+  --reuse-artifacts \
+  --no-open
+```
+
+Step 3 checks R2 access, revalidates all staged checksums, verifies the public
+CDN copies of the DMGs and update ZIPs, and only then advances `latest.json`.
+If it fails after artifacts are created, rerun step 3 unchanged; do not rebuild
+the same version.
+
 ### Create the release tag
 
 1. Update `Cargo.toml` to the intended version and merge the change.
