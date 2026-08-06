@@ -37,6 +37,7 @@ const FILE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(220);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FILE_RESULT_LIMIT: usize = 50;
+const ROOT_FILE_RESULT_LIMIT: usize = 2;
 
 const TEXT_PRIMARY: Color = Color {
     r: 0.95,
@@ -118,6 +119,7 @@ struct Launcher {
     file_query_changed_at: Instant,
     file_results: Vec<CatalogItem>,
     file_search_error: Option<String>,
+    quick_look_path: Option<PathBuf>,
     clipboard_change_count: Option<i64>,
     clipboard_error: Option<String>,
     update_checking: bool,
@@ -256,6 +258,10 @@ enum Message {
         revision: u64,
         result: Result<Vec<PathBuf>, String>,
     },
+    FileIconsLoaded {
+        revision: u64,
+        handles: HashMap<String, image::Handle>,
+    },
     ClipboardPollTick,
     CatalogLoaded {
         source: CatalogScanSource,
@@ -393,6 +399,7 @@ fn boot() -> (Launcher, Task<Message>) {
         file_query_changed_at: Instant::now(),
         file_results: Vec::new(),
         file_search_error: None,
+        quick_look_path: None,
         clipboard_change_count,
         clipboard_error,
         update_checking: update_checks_enabled,
@@ -499,7 +506,9 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         }
         Message::WindowFocused(_) => Task::none(),
         Message::WindowUnfocused(window) if window == state.launcher_window => {
-            let should_hide = state.window_focused && state.visible && !state.launching;
+            let quick_look_open = quick_look_is_open(state);
+            let should_hide =
+                state.window_focused && state.visible && !state.launching && !quick_look_open;
             if state.visible {
                 restore_input_source(state);
             }
@@ -516,14 +525,12 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         }
         Message::WindowCloseRequested(_) => Task::none(),
         Message::QueryChanged(query) => {
+            close_quick_look(state);
             state.query = query;
             state.selected = 0;
             refresh_dynamic_results(state);
-            if state.search_mode == Some(SearchMode::Files) {
-                state.file_search_revision = state.file_search_revision.wrapping_add(1);
-                state.file_query_changed_at = Instant::now();
-                state.file_search_error = None;
-                state.file_results.clear();
+            if state.search_mode.is_none() {
+                reset_file_search(state);
                 state.file_search_pending = state.query.trim().chars().count() >= 2;
             }
             Task::none()
@@ -549,9 +556,13 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
             let result_copy = state.page == Page::Launcher
                 && modifiers.command()
                 && matches!(key.as_ref(), keyboard::Key::Character(character) if character.eq_ignore_ascii_case("c"));
+            let result_quick_look = state.page == Page::Launcher
+                && modifiers.command()
+                && matches!(key.as_ref(), keyboard::Key::Character(character) if character.eq_ignore_ascii_case("y"));
             if status == event::Status::Captured
                 && (!escape || (state.page == Page::Settings && state.input_source_picker_open))
                 && !result_copy
+                && !result_quick_look
             {
                 Task::none()
             } else {
@@ -727,9 +738,7 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
         Message::FileSearchTick => maybe_start_file_search(state),
         Message::FileSearchFinished { revision, result } => {
             state.file_search_in_progress = false;
-            if state.search_mode == Some(SearchMode::Files)
-                && revision == state.file_search_revision
-            {
+            if state.search_mode.is_none() && revision == state.file_search_revision {
                 match result {
                     Ok(paths) => {
                         state.file_results = paths
@@ -746,15 +755,21 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
                             })
                             .collect();
                         state.file_search_error = None;
-                        state.selected = state
-                            .selected
-                            .min(state.file_results.len().saturating_sub(1));
+                        state.selected =
+                            state.selected.min(state.results().len().saturating_sub(1));
+                        return load_file_icons(revision, state.file_results.clone());
                     }
                     Err(error) => {
                         state.file_results.clear();
                         state.file_search_error = Some(error);
                     }
                 }
+            }
+            Task::none()
+        }
+        Message::FileIconsLoaded { revision, handles } => {
+            if state.search_mode.is_none() && revision == state.file_search_revision {
+                state.icon_handles.extend(handles);
             }
             Task::none()
         }
@@ -962,15 +977,23 @@ fn handle_key(
             let result_count = state.results().len();
             if result_count > 0 {
                 state.selected = (state.selected + 1).min(result_count - 1);
+                sync_quick_look_to_selection(state);
             }
             Task::none()
         }
         keyboard::Key::Named(Named::ArrowUp) => {
             state.selected = state.selected.saturating_sub(1);
+            sync_quick_look_to_selection(state);
             Task::none()
         }
         keyboard::Key::Named(Named::Enter) if modifiers.command() => reveal_selected_path(state),
         keyboard::Key::Named(Named::Enter) => activate_selected(state),
+        keyboard::Key::Character(character)
+            if modifiers.command() && character.eq_ignore_ascii_case("y") =>
+        {
+            toggle_selected_quick_look(state);
+            Task::none()
+        }
         keyboard::Key::Character(character)
             if modifiers.command()
                 && character.eq_ignore_ascii_case("d")
@@ -980,7 +1003,10 @@ fn handle_key(
             Task::none()
         }
         keyboard::Key::Named(Named::Escape) => {
-            if state.search_mode.is_some() {
+            if quick_look_is_open(state) {
+                close_quick_look(state);
+                Task::none()
+            } else if state.search_mode.is_some() {
                 exit_search_mode(state)
             } else {
                 hide_launcher(state)
@@ -1007,6 +1033,7 @@ fn handle_key(
 }
 
 fn activate_selected(state: &mut Launcher) -> Task<Message> {
+    close_quick_look(state);
     let results = state.results();
     let Some(result) = results.get(state.selected) else {
         return Task::none();
@@ -1015,10 +1042,84 @@ fn activate_selected(state: &mut Launcher) -> Task<Message> {
     activate_item(state, &item_id)
 }
 
+fn toggle_selected_quick_look(state: &mut Launcher) {
+    let Some(path) = selected_file_or_folder_path(state) else {
+        state.notice = Some(Notice::info(
+            "Quick Look is available for files and folders",
+        ));
+        return;
+    };
+
+    if state.quick_look_path.as_ref() == Some(&path) && quick_look_is_open(state) {
+        close_quick_look(state);
+        return;
+    }
+
+    show_quick_look(state, path);
+}
+
+fn sync_quick_look_to_selection(state: &mut Launcher) {
+    if !quick_look_is_open(state) {
+        return;
+    }
+    let Some(path) = selected_file_or_folder_path(state) else {
+        close_quick_look(state);
+        return;
+    };
+    if state.quick_look_path.as_ref() != Some(&path) {
+        show_quick_look(state, path);
+    }
+}
+
+fn selected_file_or_folder_path(state: &Launcher) -> Option<PathBuf> {
+    let item = state.results().get(state.selected)?.item.clone();
+    match item.action {
+        LaunchAction::OpenPath { path } => Some(path),
+        _ => None,
+    }
+}
+
+fn show_quick_look(state: &mut Launcher, path: PathBuf) {
+    match platform::show_quick_look(&path) {
+        Ok(()) => state.quick_look_path = Some(path),
+        Err(error) => {
+            state.quick_look_path = None;
+            state.notice = Some(Notice::error(format!("Could not open Quick Look: {error}")));
+        }
+    }
+}
+
+fn close_quick_look(state: &mut Launcher) {
+    if state.quick_look_path.take().is_some()
+        && let Err(error) = platform::close_quick_look()
+    {
+        tracing::debug!(error = %error, "Could not close Quick Look");
+    }
+}
+
+fn quick_look_is_open(state: &mut Launcher) -> bool {
+    if state.quick_look_path.is_none() {
+        return false;
+    }
+    match platform::quick_look_is_open() {
+        Ok(true) => true,
+        Ok(false) => {
+            state.quick_look_path = None;
+            false
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "Could not check Quick Look status");
+            state.quick_look_path = None;
+            false
+        }
+    }
+}
+
 fn reveal_selected_path(state: &mut Launcher) -> Task<Message> {
     if state.launching {
         return Task::none();
     }
+    close_quick_look(state);
 
     let Some(item) = state
         .results()
@@ -1048,6 +1149,7 @@ fn copy_selected(state: &mut Launcher) -> Task<Message> {
     if state.launching {
         return Task::none();
     }
+    close_quick_look(state);
 
     let Some(item) = state
         .results()
@@ -1252,6 +1354,22 @@ fn load_icons(revision: u64, applications: Vec<CatalogItem>) -> Task<Message> {
     )
 }
 
+fn load_file_icons(revision: u64, files: Vec<CatalogItem>) -> Task<Message> {
+    Task::perform(
+        async move {
+            files
+                .into_iter()
+                .filter_map(|item| {
+                    let path = item.action.target()?;
+                    let png = platform::file_icon_png(path)?;
+                    Some((item.id, image::Handle::from_bytes(png)))
+                })
+                .collect()
+        },
+        move |handles| Message::FileIconsLoaded { revision, handles },
+    )
+}
+
 fn toggle_pinned(state: &mut Launcher, item_id: &str) {
     let record = usage_for_mut(&mut state.store_data.usage, item_id);
     record.pinned = !record.pinned;
@@ -1307,6 +1425,7 @@ fn report_persistence_error(
 }
 
 fn open_settings(state: &mut Launcher) -> Task<Message> {
+    close_quick_look(state);
     restore_input_source(state);
     state.page = Page::Settings;
     state.search_mode = None;
@@ -1314,18 +1433,21 @@ fn open_settings(state: &mut Launcher) -> Task<Message> {
     state.input_source_picker_open = false;
     state.query.clear();
     clear_dynamic_results(state);
+    reset_file_search(state);
     state.selected = 0;
     refresh_input_sources(state);
     Task::none()
 }
 
 fn open_quick_links(state: &mut Launcher) -> Task<Message> {
+    close_quick_look(state);
     restore_input_source(state);
     state.quick_links_return_page = state.page;
     state.page = Page::QuickLinks;
     state.search_mode = None;
     state.query.clear();
     clear_dynamic_results(state);
+    reset_file_search(state);
     state.selected = 0;
     reset_quick_link_form(state);
     widget::operation::focus(state.quick_link_title_input.clone())
@@ -1622,10 +1744,7 @@ fn enter_search_mode(state: &mut Launcher, mode: SearchMode) -> Task<Message> {
     state.query.clear();
     clear_dynamic_results(state);
     state.selected = 0;
-    state.file_results.clear();
-    state.file_search_error = None;
-    state.file_search_pending = false;
-    state.file_search_revision = state.file_search_revision.wrapping_add(1);
+    reset_file_search(state);
     focus_search_input(state)
 }
 
@@ -1634,15 +1753,12 @@ fn exit_search_mode(state: &mut Launcher) -> Task<Message> {
     state.query.clear();
     clear_dynamic_results(state);
     state.selected = 0;
-    state.file_results.clear();
-    state.file_search_error = None;
-    state.file_search_pending = false;
-    state.file_search_revision = state.file_search_revision.wrapping_add(1);
+    reset_file_search(state);
     focus_search_input(state)
 }
 
 fn maybe_start_file_search(state: &mut Launcher) -> Task<Message> {
-    if state.search_mode != Some(SearchMode::Files)
+    if state.search_mode.is_some()
         || !state.file_search_pending
         || state.file_search_in_progress
         || state.file_query_changed_at.elapsed() < FILE_SEARCH_DEBOUNCE
@@ -1664,6 +1780,17 @@ fn maybe_start_file_search(state: &mut Launcher) -> Task<Message> {
         },
         move |result| Message::FileSearchFinished { revision, result },
     )
+}
+
+fn reset_file_search(state: &mut Launcher) {
+    state.file_search_revision = state.file_search_revision.wrapping_add(1);
+    state.file_search_pending = false;
+    state.file_query_changed_at = Instant::now();
+    for item in &state.file_results {
+        state.icon_handles.remove(&item.id);
+    }
+    state.file_results.clear();
+    state.file_search_error = None;
 }
 
 fn poll_clipboard_history(state: &mut Launcher) {
@@ -1881,6 +2008,7 @@ fn show_launcher(state: &mut Launcher) -> Task<Message> {
         state.input_source_picker_open = false;
         state.query.clear();
         clear_dynamic_results(state);
+        reset_file_search(state);
         state.selected = 0;
     }
     state.visible = true;
@@ -1897,6 +2025,7 @@ fn focus_search_input(state: &mut Launcher) -> Task<Message> {
 }
 
 fn hide_launcher(state: &mut Launcher) -> Task<Message> {
+    close_quick_look(state);
     restore_input_source(state);
     state.visible = false;
     state.window_focused = false;
@@ -1904,6 +2033,7 @@ fn hide_launcher(state: &mut Launcher) -> Task<Message> {
     state.search_mode = None;
     state.capturing_shortcut = false;
     state.input_source_picker_open = false;
+    reset_file_search(state);
     window::set_mode(state.launcher_window, window::Mode::Hidden)
 }
 
@@ -1915,6 +2045,7 @@ fn close_settings(state: &mut Launcher) -> Task<Message> {
 }
 
 fn quit_launcher(state: &mut Launcher) -> Task<Message> {
+    close_quick_look(state);
     restore_input_source(state);
     iced::exit()
 }
@@ -1939,7 +2070,6 @@ fn view(state: &Launcher, _window: window::Id) -> Element<'_, Message> {
 enum HeaderContext {
     Launcher,
     Settings,
-    Files,
     Clipboard,
     QuickLinks,
     Confirmation,
@@ -1962,15 +2092,6 @@ fn header(state: &Launcher, context: HeaderContext) -> Element<'_, Message> {
             button(text("‹  Back").size(13))
                 .padding([7, 10])
                 .on_press(Message::CloseSettings)
-                .style(secondary_button_style)
-                .into(),
-        ),
-        HeaderContext::Files => (
-            "Spotlight file search",
-            "FILES",
-            button(text("‹  All").size(13))
-                .padding([7, 10])
-                .on_press(Message::ExitSearchMode)
                 .style(secondary_button_style)
                 .into(),
         ),
@@ -2040,7 +2161,9 @@ fn header(state: &Launcher, context: HeaderContext) -> Element<'_, Message> {
 }
 
 fn selected_shortcut_hint(state: &Launcher, results: &[SearchResult]) -> String {
-    let escape = if state.search_mode.is_some() {
+    let escape = if state.quick_look_path.is_some() {
+        "esc close preview"
+    } else if state.search_mode.is_some() {
         "esc all"
     } else {
         "esc hide"
@@ -2050,9 +2173,8 @@ fn selected_shortcut_hint(state: &Launcher, results: &[SearchResult]) -> String 
     };
 
     let primary = match &item.action {
-        LaunchAction::OpenApplication { .. } | LaunchAction::OpenPath { .. } => {
-            "↵ open   ⌘↵ Finder   ⌘C path"
-        }
+        LaunchAction::OpenApplication { .. } => "↵ open   ⌘↵ Finder   ⌘C path",
+        LaunchAction::OpenPath { .. } => "↵ open   ⌘Y Quick Look   ⌘↵ Finder   ⌘C path",
         LaunchAction::OpenUrl { .. } => "↵ open   ⌘C URL",
         LaunchAction::CopyText { .. } => "↵ copy   ⌘C copy",
         LaunchAction::SystemCommand { command } if command.requires_confirmation() => "↵ review",
@@ -2072,12 +2194,10 @@ fn selected_shortcut_hint(state: &Launcher, results: &[SearchResult]) -> String 
 
 fn launcher_view(state: &Launcher) -> Element<'_, Message> {
     let placeholder = match state.search_mode {
-        Some(SearchMode::Files) => "Search file and folder names…",
         Some(SearchMode::Clipboard) => "Filter clipboard history…",
-        None => "Search applications and actions…",
+        None => "Search apps, files, commands, and more…",
     };
     let header_context = match state.search_mode {
-        Some(SearchMode::Files) => HeaderContext::Files,
         Some(SearchMode::Clipboard) => HeaderContext::Clipboard,
         None => HeaderContext::Launcher,
     };
@@ -2093,22 +2213,6 @@ fn launcher_view(state: &Launcher) -> Element<'_, Message> {
     let mut result_list = iced::widget::column![].spacing(2);
     if results.is_empty() && !state.loading {
         let (empty_title, empty_detail) = match state.search_mode {
-            Some(SearchMode::Files) if state.query.trim().chars().count() < 2 => {
-                ("Search Files", "Type at least 2 characters")
-            }
-            Some(SearchMode::Files)
-                if state.file_search_pending || state.file_search_in_progress =>
-            {
-                ("Searching…", "Waiting for Spotlight")
-            }
-            Some(SearchMode::Files) if state.file_search_error.is_some() => (
-                "File search unavailable",
-                state
-                    .file_search_error
-                    .as_deref()
-                    .unwrap_or("Unknown error"),
-            ),
-            Some(SearchMode::Files) => ("No files found", "Try a shorter file name"),
             Some(SearchMode::Clipboard)
                 if state.clipboard_error.is_some()
                     && state.store_data.clipboard_history.is_empty() =>
@@ -2163,6 +2267,8 @@ fn launcher_view(state: &Launcher) -> Element<'_, Message> {
             .color(TEXT_SECONDARY)
     } else if state.file_search_pending || state.file_search_in_progress {
         text("Searching files…").size(11).color(TEXT_SECONDARY)
+    } else if state.file_search_error.is_some() {
+        text("File search unavailable").size(11).color(DANGER)
     } else {
         text("Ready").size(11).color(TEXT_SECONDARY)
     };
@@ -2900,13 +3006,6 @@ fn listen_for_events(event: Event, status: event::Status, window: window::Id) ->
 impl Launcher {
     fn results(&self) -> Vec<SearchResult> {
         match self.search_mode {
-            Some(SearchMode::Files) => self
-                .file_results
-                .iter()
-                .take(RESULT_LIMIT)
-                .cloned()
-                .map(dynamic_search_result)
-                .collect(),
             Some(SearchMode::Clipboard) => self
                 .store_data
                 .clipboard_history
@@ -2928,7 +3027,9 @@ impl Launcher {
                 })
                 .collect(),
             None => {
+                let file_count = self.file_results.len().min(ROOT_FILE_RESULT_LIMIT);
                 let reserved = usize::from(self.calculator_result.is_some())
+                    + file_count
                     + usize::from(self.web_search_result.is_some());
                 let mut results = self.catalog.search(
                     &self.query,
@@ -2939,6 +3040,13 @@ impl Launcher {
                 if let Some(item) = self.calculator_result.clone() {
                     results.insert(0, dynamic_search_result(item));
                 }
+                results.extend(
+                    self.file_results
+                        .iter()
+                        .take(file_count)
+                        .cloned()
+                        .map(dynamic_search_result),
+                );
                 if let Some(item) = self.web_search_result.clone() {
                     results.push(dynamic_search_result(item));
                 }
@@ -3453,6 +3561,7 @@ mod tests {
             file_query_changed_at: Instant::now(),
             file_results: Vec::new(),
             file_search_error: None,
+            quick_look_path: None,
             clipboard_change_count: None,
             clipboard_error: None,
             update_checking: false,
@@ -3570,6 +3679,30 @@ mod tests {
     }
 
     #[test]
+    fn captured_command_y_reaches_quick_look_handling() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Example.app",
+            "Example",
+        ));
+        let window = launcher.launcher_window;
+
+        let _ = update(
+            &mut launcher,
+            Message::KeyPressed {
+                window,
+                key: keyboard::Key::Character("y".into()),
+                modifiers: keyboard::Modifiers::COMMAND,
+                status: event::Status::Captured,
+            },
+        );
+
+        assert_eq!(
+            launcher.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("Quick Look is available for files and folders")
+        );
+    }
+
+    #[test]
     fn clipboard_results_are_filtered_newest_first_and_copy_the_full_text() {
         let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
         launcher.search_mode = Some(SearchMode::Clipboard);
@@ -3600,9 +3733,12 @@ mod tests {
     }
 
     #[test]
-    fn file_mode_returns_only_current_spotlight_results() {
-        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
-        launcher.search_mode = Some(SearchMode::Files);
+    fn root_results_include_current_spotlight_results_after_catalog_items() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Report Viewer.app",
+            "Report Viewer",
+        ));
+        let _ = update(&mut launcher, Message::QueryChanged("report".to_owned()));
         launcher.file_results = vec![CatalogItem::path(
             "/Users/example/Documents/report.pdf",
             "report.pdf",
@@ -3611,10 +3747,15 @@ mod tests {
 
         let results = launcher.results();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].item.title, "report.pdf");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].item.title, "Report Viewer");
+        assert_eq!(results[1].item.title, "report.pdf");
         assert!(matches!(
-            results[0].item.action,
+            results[2].item.action,
+            LaunchAction::OpenUrl { .. }
+        ));
+        assert!(matches!(
+            results[1].item.action,
             LaunchAction::OpenPath { .. }
         ));
     }

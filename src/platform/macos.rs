@@ -6,9 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,8 +18,10 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::{CFString, CFStringRef};
 use directories::UserDirs;
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-use objc2_foundation::NSString;
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypeString, NSWorkspace,
+};
+use objc2_foundation::{NSData, NSDictionary, NSString};
 use plist::{Dictionary, Value};
 use walkdir::WalkDir;
 
@@ -33,9 +35,11 @@ const OPEN_EXECUTABLE: &str = "/usr/bin/open";
 const MDFIND_EXECUTABLE: &str = "/usr/bin/mdfind";
 const OSASCRIPT_EXECUTABLE: &str = "/usr/bin/osascript";
 const PMSET_EXECUTABLE: &str = "/usr/bin/pmset";
+const QLMANAGE_EXECUTABLE: &str = "/usr/bin/qlmanage";
 const LAUNCH_AGENT_LABEL: &str = "com.duckgoo.key";
 const LAUNCH_AGENT_FILE_NAME: &str = "com.duckgoo.key.plist";
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FILE_ICON_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED_PASTEBOARD_TYPES: [&str; 8] = [
     "org.nspasteboard.TransientType",
     "org.nspasteboard.ConcealedType",
@@ -47,6 +51,7 @@ const IGNORED_PASTEBOARD_TYPES: [&str; 8] = [
     "Pasteboard generator type",
 ];
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QUICK_LOOK_CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SystemCommandSpec {
@@ -349,6 +354,129 @@ pub fn search_files(query: &str, limit: usize) -> Result<Vec<PathBuf>> {
             status: status.code(),
         })
     }
+}
+
+/// Returns Finder's icon for a path as a compact PNG, when AppKit can render it.
+///
+/// The launcher treats icon lookup as best effort: files with non-Unicode paths
+/// or unusually large rendered icons retain their textual fallback instead.
+pub fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
+    let full_path = NSString::from_str(&path.to_string_lossy());
+    let image = NSWorkspace::sharedWorkspace().iconForFile(&full_path);
+    let tiff = image.TIFFRepresentation()?;
+    let bitmap = NSBitmapImageRep::imageRepWithData(&tiff)?;
+    let properties = NSDictionary::new();
+    // SAFETY: the empty dictionary contains no values with an incompatible
+    // Objective-C type for NSBitmapImageRep's PNG encoder.
+    let png = unsafe {
+        bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
+    }?;
+    data_bytes(&png)
+}
+
+/// Opens one file or folder in the macOS Quick Look preview window.
+///
+/// `qlmanage` is Apple's supported system entry point for rendering a Quick
+/// Look preview. Keeping its child process lets the launcher deterministically
+/// replace or close a preview as selection changes.
+pub fn show_quick_look(path: &Path) -> Result<()> {
+    let mut child_slot = quick_look_child_slot();
+    if let Some(mut child) = child_slot.take() {
+        stop_quick_look(&mut child)?;
+    }
+
+    let child = Command::new(QLMANAGE_EXECUTABLE)
+        .arg("-p")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|source| PlatformError::Io {
+            operation: "opening Quick Look",
+            path: PathBuf::from(QLMANAGE_EXECUTABLE),
+            source,
+        })?;
+    *child_slot = Some(child);
+    Ok(())
+}
+
+pub fn close_quick_look() -> Result<()> {
+    let mut child_slot = quick_look_child_slot();
+    if let Some(mut child) = child_slot.take() {
+        stop_quick_look(&mut child)?;
+    }
+    Ok(())
+}
+
+pub fn quick_look_is_open() -> Result<bool> {
+    let mut child_slot = quick_look_child_slot();
+    let Some(child) = child_slot.as_mut() else {
+        return Ok(false);
+    };
+    let running = child
+        .try_wait()
+        .map_err(|source| PlatformError::Io {
+            operation: "checking Quick Look",
+            path: PathBuf::from(QLMANAGE_EXECUTABLE),
+            source,
+        })?
+        .is_none();
+    if !running {
+        *child_slot = None;
+    }
+    Ok(running)
+}
+
+fn quick_look_child_slot() -> std::sync::MutexGuard<'static, Option<Child>> {
+    QUICK_LOOK_CHILD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn stop_quick_look(child: &mut Child) -> Result<()> {
+    if child
+        .try_wait()
+        .map_err(|source| PlatformError::Io {
+            operation: "checking Quick Look",
+            path: PathBuf::from(QLMANAGE_EXECUTABLE),
+            source,
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if let Err(source) = child.kill()
+        && source.kind() != io::ErrorKind::InvalidInput
+    {
+        return Err(PlatformError::Io {
+            operation: "closing Quick Look",
+            path: PathBuf::from(QLMANAGE_EXECUTABLE),
+            source,
+        });
+    }
+    child.wait().map_err(|source| PlatformError::Io {
+        operation: "waiting for Quick Look to close",
+        path: PathBuf::from(QLMANAGE_EXECUTABLE),
+        source,
+    })?;
+    Ok(())
+}
+
+fn data_bytes(data: &NSData) -> Option<Vec<u8>> {
+    let length = data.length();
+    if length == 0 || length > MAX_FILE_ICON_BYTES {
+        return None;
+    }
+    let mut bytes = vec![0; length];
+    // SAFETY: the mutable byte vector is allocated for exactly `length` bytes,
+    // which matches the NSData payload being copied.
+    unsafe {
+        data.getBytes_length(
+            std::ptr::NonNull::new(bytes.as_mut_ptr().cast())?,
+            data.length(),
+        );
+    }
+    Some(bytes)
 }
 
 fn mdfind_name_query(query: &str) -> Cow<'_, str> {
@@ -1230,7 +1358,7 @@ mod tests {
                 command: SystemCommand::OpenSystemSettings,
             },
             LaunchAction::EnterSearchMode {
-                mode: crate::catalog::SearchMode::Files,
+                mode: crate::catalog::SearchMode::Clipboard,
             },
             LaunchAction::ManageQuickLinks,
             LaunchAction::RefreshCatalog,

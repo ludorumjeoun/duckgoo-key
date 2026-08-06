@@ -45,6 +45,22 @@ pub fn search_files(_query: &str, _limit: usize) -> Result<Vec<PathBuf>> {
     Err(unsupported("searching files"))
 }
 
+pub fn file_icon_png(_path: &Path) -> Option<Vec<u8>> {
+    None
+}
+
+pub fn show_quick_look(_path: &Path) -> Result<()> {
+    Err(unsupported("showing Quick Look"))
+}
+
+pub fn close_quick_look() -> Result<()> {
+    Ok(())
+}
+
+pub fn quick_look_is_open() -> Result<bool> {
+    Ok(false)
+}
+
 pub fn clipboard_change_count() -> Result<i64> {
     Err(unsupported("reading the clipboard change count"))
 }
@@ -122,6 +138,12 @@ mod tests {
             search_files("example", 10),
             Err(PlatformError::UnsupportedPlatform { .. })
         ));
+        assert_eq!(file_icon_png(Path::new("/tmp/example")), None);
+        assert!(matches!(
+            show_quick_look(Path::new("/tmp/example")),
+            Err(PlatformError::UnsupportedPlatform { .. })
+        ));
+        assert!(close_quick_look().is_ok());
         assert!(matches!(
             clipboard_change_count(),
             Err(PlatformError::UnsupportedPlatform { .. })

@@ -18,9 +18,9 @@ reproducible Cloudflare R2 delivery path.
 - Installed application icons decoded directly from each macOS app bundle
 - Case-insensitive prefix, substring, and subsequence search
 - Pinned and frecency-based ranking
-- Explicit `=` calculator results and a DuckDuckGo web-search fallback
+- Inline calculator results, explicit `=` calculator mode, and a DuckDuckGo web-search fallback
 - User-managed HTTP/HTTPS Quick Links
-- Spotlight file and folder search within the current user's home directory
+- Spotlight file and folder results within the current user's home directory
 - Opt-in, local, text-only Clipboard History
 - Typed macOS system commands with confirmation for destructive actions
 - Configurable global launcher shortcut (`Option+Space` by default)
@@ -108,13 +108,14 @@ version, without modifying the project interpreter environment.
 | Configured shortcut (`Option+Space` by default) | Show or hide DuckGooKey globally |
 | `Up` / `Down` | Move through results |
 | `Return` | Run the selected result's primary action: open, copy, enter a search mode, or review a command |
+| `Command+Y` | Toggle Quick Look for the selected file or folder |
 | `Command+Return` | Show the selected application, file, or folder in Finder |
 | `Command+C` | Copy the selected path, URL, calculator result, or Clipboard History text, then hide |
 | `Command+P` | Pin or unpin a stable, pinnable result |
 | `Command+D` | Delete the selected entry while in Clipboard History |
 | `Command+Return` in the Quick Link editor | Save the link |
 | `Return` / `Escape` on a confirmation screen | Confirm or cancel the reviewed action |
-| `Escape` | Leave File Search or Clipboard History; otherwise hide or go back |
+| `Escape` | Close Quick Look first; otherwise leave Clipboard History, hide, or go back |
 
 DuckGooKey automatically rescans installed applications every 15 seconds. Use
 **Refresh Applications** from the result list or **Scan now** in Settings when
@@ -124,12 +125,13 @@ you want an immediate refresh.
 
 ### Calculator and web search
 
-Prefix a calculation with `=` to keep ordinary launcher searches free from
-calculator false positives:
+Clear arithmetic expressions are calculated directly in the main launcher.
+Prefix a calculation with `=` to explicitly use the full calculator grammar:
 
 ```text
-= 2 + 3 * 4
-= 1 hour to minutes
+2 + 3 * 4
+1 hour to minutes
+= answer = 42
 ```
 
 The result appears as a non-pinnable action. Press `Return` or `Command+C` to
@@ -147,12 +149,12 @@ requires confirmation.
 
 ### File search
 
-Choose **Search Files** to enter a dedicated Spotlight-backed search mode, then
-type at least two characters. DuckGooKey searches file and folder names within
-the current user's home directory without building a second on-disk index.
-`Return` opens a result, `Command+Return` reveals and selects it in Finder, and
-`Command+C` copies its absolute path. Press `Escape` to return to all launcher
-results.
+When the main search contains at least two characters, DuckGooKey also shows
+Spotlight-backed file and folder results from the current user's home directory,
+without building a second on-disk index. App and command results appear first,
+followed by matching files and folders with their Finder icons. `Return` opens a
+file, `Command+Return` reveals and selects it in Finder, and `Command+C` copies
+its absolute path.
 
 ### System commands
 

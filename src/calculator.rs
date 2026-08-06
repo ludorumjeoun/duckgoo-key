@@ -25,11 +25,14 @@ impl fend_core::Interrupt for EvaluationDeadline {
     }
 }
 
-/// Builds an inline calculator result for an explicitly prefixed expression.
+/// Builds an inline calculator result for an explicitly prefixed expression or
+/// an unambiguous arithmetic expression.
 ///
-/// Requiring `=` keeps ordinary application and command searches free from
-/// calculator false positives. A fresh fend context also prevents one query
-/// from defining variables that silently affect a later query.
+/// `=` opts into the full calculator grammar. Without it, the expression must
+/// begin with a number and contain an arithmetic operator or a unit conversion
+/// so ordinary application and command searches stay free from false positives.
+/// A fresh fend context also prevents one query from defining variables that
+/// silently affect a later query.
 pub fn calculator_item(query: &str) -> Option<CatalogItem> {
     let expression = expression_from_query(query)?;
     let result = evaluate(expression)?;
@@ -47,8 +50,30 @@ pub fn calculator_item(query: &str) -> Option<CatalogItem> {
 
 fn expression_from_query(query: &str) -> Option<&str> {
     let query = query.trim();
-    let expression = query.strip_prefix(PREFIX)?.trim();
-    (!expression.is_empty() && expression.len() <= MAX_EXPRESSION_BYTES).then_some(expression)
+    let expression = query
+        .strip_prefix(PREFIX)
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())
+        .or_else(|| looks_like_implicit_expression(query).then_some(query))?;
+
+    (expression.len() <= MAX_EXPRESSION_BYTES).then_some(expression)
+}
+
+fn looks_like_implicit_expression(expression: &str) -> bool {
+    let mut characters = expression.chars().peekable();
+    let starts_with_number = matches!(characters.peek(), Some('0'..='9'))
+        || matches!(characters.next(), Some('+') | Some('-'))
+            && matches!(characters.next(), Some('0'..='9'));
+    if !starts_with_number {
+        return false;
+    }
+
+    expression
+        .split_whitespace()
+        .any(|word| word.eq_ignore_ascii_case("to"))
+        || expression
+            .chars()
+            .any(|character| matches!(character, '+' | '-' | '*' | '/' | '%' | '^' | '×' | '÷'))
 }
 
 fn evaluate(expression: &str) -> Option<String> {
@@ -92,8 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn ignores_queries_that_are_not_explicit_calculations() {
-        assert!(calculator_item("2 + 2").is_none());
+    fn evaluates_unambiguous_arithmetic_without_an_explicit_prefix() {
+        assert_eq!(calculator_item("2 + 2").unwrap().title, "4");
+        assert_eq!(
+            calculator_item("1 hour to minutes").unwrap().title,
+            "60 minutes"
+        );
+    }
+
+    #[test]
+    fn ignores_queries_that_are_not_unambiguous_calculations() {
+        assert!(calculator_item("Calendar").is_none());
+        assert!(calculator_item("2026 roadmap").is_none());
+        assert!(calculator_item("2 notes").is_none());
         assert!(calculator_item("").is_none());
         assert!(calculator_item(" =   ").is_none());
         assert!(calculator_item("= definitely not valid (").is_none());

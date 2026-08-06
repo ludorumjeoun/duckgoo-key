@@ -10,7 +10,6 @@ use crate::commands::SystemCommand;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
-    Files,
     Clipboard,
 }
 
@@ -121,20 +120,6 @@ impl CatalogItem {
         }
     }
 
-    pub fn search_files() -> Self {
-        Self {
-            id: "builtin:search-files".to_owned(),
-            title: "Search Files".to_owned(),
-            subtitle: Some("Find files and folders with Spotlight".to_owned()),
-            icon_path: None,
-            keywords: vec!["finder".to_owned(), "spotlight".to_owned()],
-            pinnable: true,
-            action: LaunchAction::EnterSearchMode {
-                mode: SearchMode::Files,
-            },
-        }
-    }
-
     pub fn clipboard_history() -> Self {
         Self {
             id: "builtin:clipboard-history".to_owned(),
@@ -187,7 +172,6 @@ impl CatalogItem {
 
     pub fn built_in_items() -> Vec<Self> {
         vec![
-            Self::search_files(),
             Self::clipboard_history(),
             Self::manage_quick_links(),
             Self::refresh_catalog(),

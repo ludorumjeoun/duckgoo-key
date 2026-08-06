@@ -36,8 +36,8 @@ tempfile = "3.20"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSBitmapImageRep", "NSImage", "NSImageRep", "NSPasteboard", "NSWorkspace"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSData", "NSDictionary", "NSString"] }
 
 [profile.release]
 codegen-units = 1

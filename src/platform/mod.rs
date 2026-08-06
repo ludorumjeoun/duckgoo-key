@@ -10,17 +10,19 @@ mod macos;
 
 #[cfg(not(target_os = "macos"))]
 pub use fallback::{
-    available_input_sources, clipboard_change_count, copy_text, current_input_source_identifier,
-    discover_applications, execute_system_command, launch, launch_at_login_enabled,
-    read_clipboard_text_if_changed, reveal_in_file_manager, search_files, select_input_source,
-    set_launch_at_login,
+    available_input_sources, clipboard_change_count, close_quick_look, copy_text,
+    current_input_source_identifier, discover_applications, execute_system_command, file_icon_png,
+    launch, launch_at_login_enabled, quick_look_is_open, read_clipboard_text_if_changed,
+    reveal_in_file_manager, search_files, select_input_source, set_launch_at_login,
+    show_quick_look,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    available_input_sources, clipboard_change_count, copy_text, current_input_source_identifier,
-    discover_applications, execute_system_command, launch, launch_at_login_enabled,
-    read_clipboard_text_if_changed, reveal_in_file_manager, search_files, select_input_source,
-    set_launch_at_login,
+    available_input_sources, clipboard_change_count, close_quick_look, copy_text,
+    current_input_source_identifier, discover_applications, execute_system_command, file_icon_png,
+    launch, launch_at_login_enabled, quick_look_is_open, read_clipboard_text_if_changed,
+    reveal_in_file_manager, search_files, select_input_source, set_launch_at_login,
+    show_quick_look,
 };
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
