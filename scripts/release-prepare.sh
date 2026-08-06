@@ -55,16 +55,16 @@ done
   usage >&2
   exit 2
 }
-if [[ ! "$version" =~ ^[0-9]+.[0-9]+.[0-9]+(-[0-9A-Za-z.-]+)?(+[0-9A-Za-z.-]+)?$ ]]; then
-  die "VERSION must be SemVer without a leading v"
-fi
-
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v mise >/dev/null 2>&1 || die "mise is required"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd "$script_dir/.." && pwd)"
 cd "$project_dir"
+
+if ! mise exec -- python3 "$script_dir/compare-semver.py" "$version" "$version" >/dev/null; then
+  die "VERSION must be SemVer without a leading v"
+fi
 
 [[ -z "$(git status --porcelain --untracked-files=all)" ]] \
   || die "the working tree must be clean"
