@@ -26,6 +26,10 @@ duckgookey_resolve_default_user_keychain() {
     DUCKGOOKEY_R2_CREDENTIAL_ERROR="could not resolve the default user Keychain"
     return 1
   fi
+  # security prefixes the quoted path with spaces on current macOS releases.
+  # Trim those before removing the surrounding quotes so it remains a valid
+  # positional Keychain path for find-generic-password.
+  keychain="$(printf '%s' "$keychain" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   keychain="${keychain#\"}"
   keychain="${keychain%\"}"
   if [[ -z "$keychain" ]]; then

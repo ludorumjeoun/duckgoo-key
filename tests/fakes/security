@@ -18,7 +18,7 @@ require_value() {
 case "${1-}" in
   default-keychain)
     log "default-keychain"
-    printf '"%s/login.keychain-db"\n' "$FAKE_SECURITY_DIR"
+    printf '    "%s/login.keychain-db"\n' "$FAKE_SECURITY_DIR"
     ;;
   find-identity)
     log "find-identity"
