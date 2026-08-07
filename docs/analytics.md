@@ -6,8 +6,10 @@ PostHog, Google Analytics, session replay, or an internal dashboard.
 ## What is recorded
 
 The website records `download_requested` before redirecting a user to a signed
-DMG. The app records the following only after the user turns on **Anonymous
-usage stats** in Settings:
+DMG. Before the app records anything, its first-run welcome screen explains the
+following required anonymous usage statistics and asks the user to select
+**Get Started**. The setting is then shown as active in Settings;
+there is no opt-out control.
 
 - `first_launch`
 - `active_daily` (at most once per UTC day)
@@ -16,7 +18,9 @@ usage stats** in Settings:
 
 Never send searches, selected application names, file paths, Quick Links,
 clipboard entries, user names, email addresses, or IP addresses as event
-properties.
+properties. The random installation UUID is a persistent pseudonymous
+identifier used only to count distinct active installations; it is not an
+account, hardware serial number, or device name.
 
 ## Cloudflare setup
 
@@ -46,4 +50,5 @@ mise run analytics-report -- monthly
 Each report prints aggregate event totals by platform/version and the number of
 distinct anonymous installations that sent `active_daily` in the selected
 period. It is an active-installation estimate, not a claim of every installed
-copy.
+copy. Existing installations see the first-run disclosure once after upgrading
+to this policy and do not send new events until they acknowledge it.

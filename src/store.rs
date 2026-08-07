@@ -49,9 +49,6 @@ pub struct AppSettings {
     /// Update checks are enabled by default, including for existing settings files.
     #[serde(default = "default_update_checks_enabled")]
     pub update_checks_enabled: bool,
-    /// Anonymous release telemetry is sent only after the user opts in.
-    #[serde(default)]
-    pub anonymous_usage_stats_enabled: bool,
     /// Search engine used by the dynamic web-search fallback.
     #[serde(default)]
     pub search_engine: SearchEngine,
@@ -64,7 +61,6 @@ impl Default for AppSettings {
             preferred_input_source: None,
             clipboard_history_enabled: false,
             update_checks_enabled: default_update_checks_enabled(),
-            anonymous_usage_stats_enabled: false,
             search_engine: SearchEngine::default(),
         }
     }
@@ -86,7 +82,10 @@ pub struct StoreData {
     pub clipboard_history: ClipboardHistory,
     #[serde(default = "default_next_clipboard_entry_id")]
     pub next_clipboard_entry_id: u64,
-    /// Opaque random ID used only when anonymous usage statistics are enabled.
+    /// Whether the required anonymous-usage disclosure was acknowledged.
+    #[serde(default)]
+    pub telemetry_disclosure_acknowledged: bool,
+    /// Opaque random ID used only for anonymous usage statistics.
     #[serde(default)]
     pub telemetry_installation_id: Option<String>,
     /// UTC day when the last daily activity event was scheduled.
@@ -104,6 +103,7 @@ impl Default for StoreData {
             next_quick_link_id: default_next_quick_link_id(),
             clipboard_history: ClipboardHistory::default(),
             next_clipboard_entry_id: default_next_clipboard_entry_id(),
+            telemetry_disclosure_acknowledged: false,
             telemetry_installation_id: None,
             telemetry_last_active_day: None,
         }
@@ -595,6 +595,7 @@ mod tests {
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
         assert!(data.settings.update_checks_enabled);
+        assert!(!data.telemetry_disclosure_acknowledged);
         assert_eq!(data.settings.search_engine, SearchEngine::Google);
     }
 
@@ -608,7 +609,18 @@ mod tests {
         assert_eq!(data.settings.shortcut, ShortcutBinding::default());
         assert_eq!(data.settings.preferred_input_source, None);
         assert!(data.settings.update_checks_enabled);
+        assert!(!data.telemetry_disclosure_acknowledged);
         assert_eq!(data.settings.search_engine, SearchEngine::Google);
+    }
+
+    #[test]
+    fn legacy_telemetry_opt_out_field_is_ignored_after_deserialization() {
+        let data: StoreData = serde_json::from_str(
+            r#"{"schema_version":2,"settings":{"anonymous_usage_stats_enabled":false}}"#,
+        )
+        .unwrap();
+
+        assert!(!data.telemetry_disclosure_acknowledged);
     }
 
     #[test]

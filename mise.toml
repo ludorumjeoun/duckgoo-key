@@ -21,6 +21,10 @@ aws = "2.36.13"
 description = "Run DuckGooKey locally in debug mode"
 run = "cargo run --locked"
 
+[tasks.screenshot-greeting]
+description = "Render the first-run greeting screen to target/ui-snapshots/greeting.png without opening a native window"
+run = "cargo test --locked app::tests::capture_greeting_screen_to_png -- --ignored --exact --nocapture"
+
 [tasks.check]
 description = "Run formatting, tests, lints, and the release build"
 run = """

@@ -238,6 +238,7 @@ The main development tasks are:
 | --- | --- |
 | `mise run dev` | Compile and run the local debug build without packaging |
 | `mise run check` | Check formatting, run all tests and Clippy, and make a release build |
+| `mise run screenshot-greeting` | Render the first-run greeting to `target/ui-snapshots/greeting.png` without opening a native window |
 | `mise run package` | Build the release `.app` and DMG, then open the output folder |
 | `mise run package -- --no-open` | Build the same packages without opening Finder |
 | `mise run release-configure` | Store local release settings and R2 credentials securely in Keychain |
@@ -283,7 +284,7 @@ Iced launcher UI
   ├── shortcut: validated, persisted global shortcut model
   ├── store: atomic persisted settings and usage state
   ├── integrations: global shortcut and menu bar events
-  ├── telemetry: opt-in anonymous release signals only
+  ├── telemetry: anonymous release signals after first-run disclosure
   └── platform
       ├── macOS: bundle/Spotlight discovery, clipboard, system commands,
       │          /usr/bin/open, and LaunchAgent

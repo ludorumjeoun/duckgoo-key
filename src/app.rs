@@ -134,6 +134,7 @@ struct Launcher {
     confirmation_return_page: Page,
     catalog: Catalog,
     brand_icon: image::Handle,
+    greeting_mascot: image::Handle,
     icon_handles: HashMap<String, image::Handle>,
     catalog_revision: u64,
     store_data: StoreData,
@@ -169,6 +170,7 @@ struct MergedRootResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Launcher,
+    TelemetryDisclosure,
     Settings,
     QuickLinks,
     Confirmation,
@@ -258,7 +260,7 @@ enum Message {
     RequestDeleteQuickLink(u64),
     CancelQuickLinkEdit,
     SetClipboardHistoryEnabled(bool),
-    SetAnonymousUsageStatsEnabled(bool),
+    AcknowledgeTelemetryDisclosure,
     SetUpdateChecksEnabled(bool),
     SetSearchEngine(SearchEngine),
     CheckForUpdates,
@@ -344,7 +346,11 @@ fn boot() -> (Launcher, Task<Message>) {
     let quick_link_title_input = widget::Id::unique();
     let quick_link_url_input = widget::Id::unique();
     let (store, mut store_data, mut notice) = load_store();
-    let mut telemetry_events = schedule_startup_telemetry(&mut store_data);
+    let mut telemetry_events = if store_data.telemetry_disclosure_acknowledged {
+        schedule_startup_telemetry(&mut store_data)
+    } else {
+        Vec::new()
+    };
     if !telemetry_events.is_empty() {
         let saved = store
             .as_ref()
@@ -353,7 +359,7 @@ fn boot() -> (Launcher, Task<Message>) {
             telemetry_events.clear();
             if notice.is_none() {
                 notice = Some(Notice::error(
-                    "Anonymous usage statistics could not be prepared because local settings are unavailable",
+                    "The install note could not be prepared because local settings are unavailable",
                 ));
             }
         }
@@ -374,6 +380,7 @@ fn boot() -> (Launcher, Task<Message>) {
     let starts_hidden = std::env::args_os()
         .skip(1)
         .any(|argument| argument == std::ffi::OsStr::new(crate::START_HIDDEN_ARGUMENT));
+    let initial_page = initial_page(&store_data);
     let mut window_settings = window::Settings {
         size: Size::new(720.0, 520.0),
         position: window::Position::Centered,
@@ -404,7 +411,7 @@ fn boot() -> (Launcher, Task<Message>) {
         query_input,
         quick_link_title_input,
         quick_link_url_input,
-        page: Page::Launcher,
+        page: initial_page,
         search_mode: None,
         query: String::new(),
         calculator_result: None,
@@ -443,6 +450,7 @@ fn boot() -> (Launcher, Task<Message>) {
         brand_icon: image::Handle::from_bytes(
             include_bytes!("../assets/icons/duckgoo-key-128.png").to_vec(),
         ),
+        greeting_mascot: greeting_mascot_handle(),
         icon_handles: HashMap::new(),
         catalog_revision: 0,
         store_data,
@@ -464,6 +472,18 @@ fn boot() -> (Launcher, Task<Message>) {
             telemetry_tasks(telemetry_events),
         ]),
     )
+}
+
+fn greeting_mascot_handle() -> image::Handle {
+    image::Handle::from_bytes(include_bytes!("../assets/duckgoo-greeting-mascot.png").to_vec())
+}
+
+#[cfg(test)]
+fn greeting_mascot_rgba_handle() -> image::Handle {
+    let mascot = ::image::load_from_memory(include_bytes!("../assets/duckgoo-greeting-mascot.png"))
+        .expect("the bundled DuckGoo greeting mascot must be a valid PNG")
+        .to_rgba8();
+    image::Handle::from_rgba(mascot.width(), mascot.height(), mascot.into_raw())
 }
 
 fn load_input_sources() -> (Vec<platform::InputSource>, Option<String>) {
@@ -505,6 +525,14 @@ fn load_store() -> (Option<Store>, StoreData, Option<Notice>) {
     }
 }
 
+fn initial_page(data: &StoreData) -> Page {
+    if data.telemetry_disclosure_acknowledged {
+        Page::Launcher
+    } else {
+        Page::TelemetryDisclosure
+    }
+}
+
 fn update(state: &mut Launcher, message: Message) -> Task<Message> {
     match message {
         Message::WindowOpened(window) if window == state.launcher_window => {
@@ -518,7 +546,7 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
             }
             state.integrations = Some(integrations);
 
-            if state.visible {
+            if state.visible && state.page == Page::Launcher {
                 focus_search_input(state)
             } else {
                 Task::none()
@@ -630,9 +658,7 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
             set_clipboard_history_enabled(state, enabled);
             Task::none()
         }
-        Message::SetAnonymousUsageStatsEnabled(enabled) => {
-            set_anonymous_usage_stats_enabled(state, enabled)
-        }
+        Message::AcknowledgeTelemetryDisclosure => acknowledge_telemetry_disclosure(state),
         Message::SetUpdateChecksEnabled(enabled) => {
             set_update_checks_enabled(state, enabled);
             Task::none()
@@ -948,6 +974,16 @@ fn handle_key(
     modifiers: keyboard::Modifiers,
 ) -> Task<Message> {
     match state.page {
+        Page::TelemetryDisclosure => {
+            return match key.as_ref() {
+                keyboard::Key::Named(Named::Enter) => acknowledge_telemetry_disclosure(state),
+                keyboard::Key::Named(Named::Tab) if modifiers.shift() => {
+                    widget::operation::focus_previous()
+                }
+                keyboard::Key::Named(Named::Tab) => widget::operation::focus_next(),
+                _ => Task::none(),
+            };
+        }
         Page::Settings => {
             if state.input_source_picker_open {
                 return if matches!(key.as_ref(), keyboard::Key::Named(Named::Escape)) {
@@ -1662,39 +1698,29 @@ fn set_search_engine(state: &mut Launcher, engine: SearchEngine) {
     state.notice = Some(Notice::info(format!("Web searches will use {engine}")));
 }
 
-fn set_anonymous_usage_stats_enabled(state: &mut Launcher, enabled: bool) -> Task<Message> {
-    if state.store_data.settings.anonymous_usage_stats_enabled == enabled {
-        return Task::none();
+fn acknowledge_telemetry_disclosure(state: &mut Launcher) -> Task<Message> {
+    if state.store_data.telemetry_disclosure_acknowledged {
+        state.page = Page::Launcher;
+        return focus_search_input(state);
     }
 
     let mut candidate = state.store_data.clone();
-    candidate.settings.anonymous_usage_stats_enabled = enabled;
-    let events = if enabled {
-        schedule_startup_telemetry(&mut candidate)
-    } else {
-        candidate.telemetry_installation_id = None;
-        candidate.telemetry_last_active_day = None;
-        Vec::new()
-    };
+    candidate.telemetry_disclosure_acknowledged = true;
+    let events = schedule_startup_telemetry(&mut candidate);
 
     if save_candidate(state, &candidate).is_err() {
         return Task::none();
     }
 
     state.store_data = candidate;
-    state.notice = Some(Notice::info(if enabled {
-        "Anonymous usage statistics enabled · searches, apps, files, and clipboard content stay private"
-    } else {
-        "Anonymous usage statistics disabled"
-    }));
-    telemetry_tasks(events)
+    state.page = Page::Launcher;
+    state.notice = Some(Notice::info(
+        "Thanks — I can now see which DuckGooKey versions and Mac types are in use",
+    ));
+    focus_search_input(state).chain(telemetry_tasks(events))
 }
 
 fn schedule_startup_telemetry(data: &mut StoreData) -> Vec<(telemetry::Event, String)> {
-    if !data.settings.anonymous_usage_stats_enabled {
-        return Vec::new();
-    }
-
     let mut events = Vec::new();
     let installation_id = match data.telemetry_installation_id.as_deref() {
         Some(id) if !id.is_empty() => id.to_owned(),
@@ -2077,7 +2103,7 @@ fn handle_integration_event(state: &mut Launcher, event: IntegrationEvent) -> Ta
 
 fn show_launcher(state: &mut Launcher) -> Task<Message> {
     if !state.visible {
-        state.page = Page::Launcher;
+        state.page = initial_page(&state.store_data);
         state.search_mode = None;
         state.capturing_shortcut = false;
         state.input_source_picker_open = false;
@@ -2089,7 +2115,12 @@ fn show_launcher(state: &mut Launcher) -> Task<Message> {
     state.visible = true;
     state.window_focused = false;
 
-    focus_search_input(state)
+    if state.page == Page::Launcher {
+        focus_search_input(state)
+    } else {
+        window::set_mode(state.launcher_window, window::Mode::Windowed)
+            .chain(window::gain_focus(state.launcher_window))
+    }
 }
 
 fn focus_search_input(state: &mut Launcher) -> Task<Message> {
@@ -2104,7 +2135,7 @@ fn hide_launcher(state: &mut Launcher) -> Task<Message> {
     restore_input_source(state);
     state.visible = false;
     state.window_focused = false;
-    state.page = Page::Launcher;
+    state.page = initial_page(&state.store_data);
     state.search_mode = None;
     state.capturing_shortcut = false;
     state.input_source_picker_open = false;
@@ -2128,6 +2159,7 @@ fn quit_launcher(state: &mut Launcher) -> Task<Message> {
 fn view(state: &Launcher, _window: window::Id) -> Element<'_, Message> {
     let content = match state.page {
         Page::Launcher => launcher_view(state),
+        Page::TelemetryDisclosure => telemetry_disclosure_view(state),
         Page::Settings => settings_view(state),
         Page::QuickLinks => quick_links_view(state),
         Page::Confirmation => confirmation_view(state),
@@ -2508,18 +2540,16 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     let anonymous_usage_stats_card = container(
         iced::widget::row![
             iced::widget::column![
-                text("Anonymous usage stats").size(14).color(TEXT_PRIMARY),
-                text(
-                    "First launch and one daily activity signal · never sends searches, apps, files, or clipboard content"
-                )
-                .size(11)
-                .color(TEXT_SECONDARY),
+                text("A small note from me").size(14).color(TEXT_PRIMARY),
+                text("Active · helps me see which DuckGooKey versions and Mac types are in use")
+                    .size(11)
+                    .color(TEXT_SECONDARY),
             ]
             .spacing(4)
             .width(Fill),
-            toggler(state.store_data.settings.anonymous_usage_stats_enabled)
-                .on_toggle(Message::SetAnonymousUsageStatsEnabled)
-                .size(22),
+            container(text("ACTIVE").size(10).color(ACCENT))
+                .padding([6, 9])
+                .style(section_pill_style),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -2749,6 +2779,132 @@ fn settings_view(state: &Launcher) -> Element<'_, Message> {
     ]
     .spacing(15)
     .into()
+}
+
+fn telemetry_disclosure_view(state: &Launcher) -> Element<'_, Message> {
+    let disclosure_content = iced::widget::column![
+        text("One small note from me: I’d love to know how many people DuckGoo has reached.")
+            .size(13)
+            .color(TEXT_PRIMARY),
+        iced::widget::column![
+            text("I’d like to see which DuckGooKey versions are in use,")
+                .size(12)
+                .color(TEXT_SECONDARY),
+            text("and whether Macs are Apple silicon or Intel.")
+                .size(12)
+                .color(TEXT_SECONDARY),
+        ]
+        .spacing(1),
+        iced::widget::column![
+            text("That means a random install ID, app version, CPU type,")
+                .size(12)
+                .color(TEXT_SECONDARY),
+            text("and a first-open or once-a-day signal.")
+                .size(12)
+                .color(TEXT_SECONDARY),
+        ]
+        .spacing(1),
+        container(widget::Space::new())
+            .width(32)
+            .height(1)
+            .style(disclosure_divider_style),
+        iced::widget::column![
+            text("Your searches, file paths, clipboard, name, and email?")
+                .size(12)
+                .color(TEXT_SECONDARY),
+            text("I don’t collect them, and I’m not interested in them.")
+                .size(12)
+                .color(TEXT_PRIMARY),
+        ]
+        .spacing(2)
+    ]
+    .spacing(8)
+    .width(Fill)
+    .align_x(Alignment::Start);
+
+    let disclosure = container(
+        container(disclosure_content)
+            .padding([4, 10])
+            .width(Fill)
+            .max_width(500),
+    )
+    .width(Fill)
+    .center_x(Fill);
+
+    let greeting =
+        iced::widget::row![
+            container(
+                image(state.greeting_mascot.clone())
+                    .width(112)
+                    .height(112)
+                    .content_fit(ContentFit::Contain),
+            )
+            .padding(7)
+            .width(126)
+            .height(126)
+            .center_x(126)
+            .center_y(126)
+            .style(greeting_mascot_style),
+            iced::widget::column![
+                text("Look, it’s DuckGoo.").size(30).color(TEXT_PRIMARY),
+                iced::widget::column![
+                text(
+                    "This is the character version of DuckGoo, the little plush that keeps me company while I work.",
+                )
+                    .size(15)
+                    .color(TEXT_PRIMARY),
+                iced::widget::column![
+                    text("This app helps you find what you need, do the math, and look things up.")
+                        .size(12)
+                        .color(TEXT_SECONDARY),
+                    text("The important thing is that DuckGoo is cute.")
+                        .size(13)
+                        .color(TEXT_PRIMARY),
+                ]
+                .spacing(2),
+            ]
+                .spacing(8),
+            ]
+            .spacing(6)
+            .width(Fill),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center)
+        .width(Fill);
+
+    let welcome_card = container(
+        iced::widget::column![
+            container(greeting).width(Fill),
+            widget::Space::new().height(14),
+            disclosure,
+            widget::Space::new().height(14),
+            container(
+                button(
+                    container(text("Okay, let’s go").size(14))
+                        .width(Fill)
+                        .height(Fill)
+                        .center_x(Fill)
+                        .center_y(Fill),
+                )
+                .padding(0)
+                .height(44)
+                .width(216)
+                .on_press(Message::AcknowledgeTelemetryDisclosure)
+                .style(greeting_button_style),
+            )
+            .width(Fill)
+            .center_x(Fill),
+        ]
+        .spacing(0),
+    )
+    .max_width(570);
+
+    container(welcome_card)
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .into()
 }
 
 fn quick_links_view(state: &Launcher) -> Element<'_, Message> {
@@ -3363,6 +3519,35 @@ fn shortcut_pill_style(_: &Theme) -> container::Style {
         })
 }
 
+fn greeting_mascot_style(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(Color {
+            r: 0.10,
+            g: 0.15,
+            b: 0.13,
+            a: 0.52,
+        })
+        .border(Border {
+            radius: 28.0.into(),
+            width: 1.0,
+            color: Color {
+                r: 0.59,
+                g: 0.87,
+                b: 0.73,
+                a: 0.13,
+            },
+        })
+}
+
+fn disclosure_divider_style(_: &Theme) -> container::Style {
+    container::Style::default().background(Color {
+        r: ACCENT.r,
+        g: ACCENT.g,
+        b: ACCENT.b,
+        a: 0.30,
+    })
+}
+
 fn section_pill_style(_: &Theme) -> container::Style {
     container::Style::default()
         .background(Color {
@@ -3620,6 +3805,80 @@ fn accent_button_style(_theme: &Theme, status: button::Status) -> button::Style 
     }
 }
 
+fn greeting_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let pressed = matches!(status, button::Status::Pressed);
+    let hovered = matches!(status, button::Status::Hovered);
+
+    button::Style {
+        background: Some(Background::Color(Color {
+            r: if pressed {
+                0.39
+            } else if hovered {
+                0.54
+            } else {
+                0.48
+            },
+            g: if pressed {
+                0.76
+            } else if hovered {
+                0.90
+            } else {
+                0.86
+            },
+            b: if pressed {
+                0.63
+            } else if hovered {
+                0.80
+            } else {
+                0.75
+            },
+            a: 1.0,
+        })),
+        text_color: Color {
+            r: 0.025,
+            g: 0.06,
+            b: 0.05,
+            a: 1.0,
+        },
+        border: Border {
+            radius: 22.0.into(),
+            width: 1.0,
+            color: Color {
+                r: 0.88,
+                g: 1.0,
+                b: 0.95,
+                a: if hovered { 0.68 } else { 0.50 },
+            },
+        },
+        shadow: Shadow {
+            color: Color {
+                r: 0.09,
+                g: 0.44,
+                b: 0.33,
+                a: if pressed { 0.12 } else { 0.25 },
+            },
+            offset: Vector::new(
+                0.0,
+                if pressed {
+                    1.0
+                } else if hovered {
+                    5.0
+                } else {
+                    3.0
+                },
+            ),
+            blur_radius: if pressed {
+                2.0
+            } else if hovered {
+                11.0
+            } else {
+                8.0
+            },
+        },
+        ..button::Style::default()
+    }
+}
+
 fn danger_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let pressed = matches!(status, button::Status::Pressed);
     button::Style {
@@ -3780,6 +4039,7 @@ mod tests {
             confirmation_return_page: Page::Launcher,
             catalog: Catalog::new([item]),
             brand_icon: image::Handle::from_bytes(Vec::new()),
+            greeting_mascot: image::Handle::from_bytes(Vec::new()),
             icon_handles: HashMap::new(),
             catalog_revision: 0,
             store_data: StoreData::default(),
@@ -4257,17 +4517,107 @@ mod tests {
     }
 
     #[test]
-    fn startup_telemetry_requires_opt_in_and_is_daily() {
+    fn startup_telemetry_is_daily_after_the_disclosure_is_acknowledged() {
         let mut data = StoreData::default();
-        assert!(schedule_startup_telemetry(&mut data).is_empty());
-        assert!(data.telemetry_installation_id.is_none());
+        assert_eq!(initial_page(&data), Page::TelemetryDisclosure);
+        data.telemetry_disclosure_acknowledged = true;
+        assert_eq!(initial_page(&data), Page::Launcher);
 
-        data.settings.anonymous_usage_stats_enabled = true;
         let events = schedule_startup_telemetry(&mut data);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, telemetry::Event::FirstLaunch);
         assert_eq!(events[1].0, telemetry::Event::ActiveDaily);
         assert!(data.telemetry_installation_id.is_some());
         assert!(schedule_startup_telemetry(&mut data).is_empty());
+    }
+
+    #[test]
+    fn acknowledging_the_welcome_persists_the_disclosure_before_telemetry() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("state.json"));
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.store = Some(store.clone());
+        launcher.page = Page::TelemetryDisclosure;
+
+        let _telemetry = acknowledge_telemetry_disclosure(&mut launcher);
+
+        assert_eq!(launcher.page, Page::Launcher);
+        assert!(launcher.store_data.telemetry_disclosure_acknowledged);
+        assert!(launcher.store_data.telemetry_installation_id.is_some());
+        assert!(launcher.store_data.telemetry_last_active_day.is_some());
+        assert!(store.load().unwrap().data.telemetry_disclosure_acknowledged);
+    }
+
+    #[test]
+    fn reopening_before_acknowledging_keeps_the_welcome_screen() {
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.visible = false;
+        launcher.page = Page::Launcher;
+
+        let _show = show_launcher(&mut launcher);
+
+        assert_eq!(launcher.page, Page::TelemetryDisclosure);
+    }
+
+    #[test]
+    #[ignore = "writes target/ui-snapshots/greeting.png for visual review"]
+    fn capture_greeting_screen_to_png() {
+        use iced::advanced::image::Renderer as ImageRenderer;
+        use iced::advanced::{
+            Layout, layout, mouse,
+            renderer::{self, Headless},
+            widget::Tree,
+        };
+
+        const WIDTH: u32 = 720;
+        const HEIGHT: u32 = 520;
+
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.page = Page::TelemetryDisclosure;
+        launcher.greeting_mascot = greeting_mascot_rgba_handle();
+
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::default(),
+            iced::Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("the headless renderer should be available for screenshots");
+        let size = Size::new(WIDTH as f32, HEIGHT as f32);
+        let viewport = iced::Rectangle::with_size(size);
+        let _greeting_mascot_allocation = renderer
+            .load_image(&launcher.greeting_mascot)
+            .expect("the headless renderer should allocate the greeting mascot");
+        let mut element = view(&launcher, launcher.launcher_window);
+        let mut tree = Tree::new(&element);
+        let layout = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &Theme::Dark,
+            &renderer::Style {
+                text_color: TEXT_PRIMARY,
+            },
+            Layout::new(&layout),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+
+        let pixels = renderer.screenshot(Size::new(WIDTH, HEIGHT), 1.0, Color::TRANSPARENT);
+        let image = ::image::RgbaImage::from_raw(WIDTH, HEIGHT, pixels)
+            .expect("the renderer must return one RGBA pixel per output pixel");
+        let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/ui-snapshots/greeting.png");
+        std::fs::create_dir_all(
+            output
+                .parent()
+                .expect("the screenshot output has a parent directory"),
+        )
+        .expect("create screenshot output directory");
+        image.save(&output).expect("write greeting screenshot");
+        println!("Wrote {}", output.display());
     }
 }
