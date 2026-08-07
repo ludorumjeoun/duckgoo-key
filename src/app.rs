@@ -1714,9 +1714,6 @@ fn acknowledge_telemetry_disclosure(state: &mut Launcher) -> Task<Message> {
 
     state.store_data = candidate;
     state.page = Page::Launcher;
-    state.notice = Some(Notice::info(
-        "Thanks — I can now see which DuckGooKey versions and Mac types are in use",
-    ));
     focus_search_input(state).chain(telemetry_tasks(events))
 }
 
