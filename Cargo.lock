@@ -1028,7 +1028,7 @@ checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
 name = "duckgoo-key"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "core-foundation 0.10.1",
  "directories",
