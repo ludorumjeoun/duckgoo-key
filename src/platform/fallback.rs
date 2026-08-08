@@ -26,6 +26,9 @@ pub fn launch(action: &LaunchAction) -> Result<()> {
         LaunchAction::RefreshCatalog => Err(PlatformError::UnsupportedAction {
             action: "refresh catalog",
         }),
+        LaunchAction::InstallUpdate => Err(PlatformError::UnsupportedAction {
+            action: "install update",
+        }),
         LaunchAction::Quit => Err(PlatformError::UnsupportedAction { action: "quit" }),
         LaunchAction::OpenApplication { .. }
         | LaunchAction::OpenPath { .. }

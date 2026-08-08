@@ -29,6 +29,7 @@ pub enum LaunchAction {
     EnterSearchMode { mode: SearchMode },
     ManageQuickLinks,
     RefreshCatalog,
+    InstallUpdate,
     Quit,
 }
 
@@ -42,6 +43,7 @@ impl LaunchAction {
             | Self::EnterSearchMode { .. }
             | Self::ManageQuickLinks
             | Self::RefreshCatalog
+            | Self::InstallUpdate
             | Self::Quit => None,
         }
     }
@@ -57,6 +59,7 @@ impl LaunchAction {
             | Self::EnterSearchMode { .. }
             | Self::ManageQuickLinks
             | Self::RefreshCatalog
+            | Self::InstallUpdate
             | Self::Quit => None,
         }
     }

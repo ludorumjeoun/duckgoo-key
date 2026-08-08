@@ -173,6 +173,11 @@ pub fn launch(action: &LaunchAction) -> Result<()> {
                 action: "refresh catalog",
             });
         }
+        LaunchAction::InstallUpdate => {
+            return Err(PlatformError::UnsupportedAction {
+                action: "install update",
+            });
+        }
         LaunchAction::Quit => {
             return Err(PlatformError::UnsupportedAction { action: "quit" });
         }
@@ -1970,6 +1975,7 @@ mod tests {
             },
             LaunchAction::ManageQuickLinks,
             LaunchAction::RefreshCatalog,
+            LaunchAction::InstallUpdate,
             LaunchAction::Quit,
         ] {
             assert!(matches!(

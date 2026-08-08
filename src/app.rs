@@ -39,6 +39,7 @@ const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const FILE_RESULT_LIMIT: usize = 50;
 const ROOT_FILE_RESULT_LIMIT: usize = 4;
+const INSTALL_UPDATE_ITEM_ID: &str = "builtin:install-update";
 
 const TEXT_PRIMARY: Color = Color {
     r: 0.95,
@@ -718,23 +719,7 @@ fn update(state: &mut Launcher, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::InstallAvailableUpdate => {
-            let Some(update) = state.available_update.clone() else {
-                return Task::none();
-            };
-            if state.update_installing {
-                return Task::none();
-            }
-            state.update_installing = true;
-            Task::perform(
-                async move {
-                    updater::download_and_prepare_install(update)
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-                Message::UpdateInstallPrepared,
-            )
-        }
+        Message::InstallAvailableUpdate => install_available_update(state),
         Message::UpdateInstallPrepared(result) => {
             state.update_installing = false;
             match result {
@@ -1295,6 +1280,25 @@ fn delete_selected_clipboard_entry(state: &mut Launcher) {
     }
 }
 
+fn install_available_update(state: &mut Launcher) -> Task<Message> {
+    let Some(update) = state.available_update.clone() else {
+        return Task::none();
+    };
+    if state.update_installing {
+        return Task::none();
+    }
+
+    state.update_installing = true;
+    Task::perform(
+        async move {
+            updater::download_and_prepare_install(update)
+                .await
+                .map_err(|error| error.to_string())
+        },
+        Message::UpdateInstallPrepared,
+    )
+}
+
 fn activate_item(state: &mut Launcher, item_id: &str) -> Task<Message> {
     if state.launching {
         return Task::none();
@@ -1318,6 +1322,7 @@ fn activate_item(state: &mut Launcher, item_id: &str) -> Task<Message> {
             state.notice = Some(Notice::info("Refreshing applications…"));
             discover_catalog(CatalogScanSource::Manual)
         }
+        LaunchAction::InstallUpdate => install_available_update(state),
         LaunchAction::Quit => quit_launcher(state),
         LaunchAction::ManageQuickLinks => {
             record_launch(state, &item.id);
@@ -2285,6 +2290,7 @@ fn selected_shortcut_hint(state: &Launcher, results: &[SearchResult]) -> String 
         LaunchAction::SystemCommand { .. } => "↵ run",
         LaunchAction::EnterSearchMode { .. } | LaunchAction::ManageQuickLinks => "↵ open",
         LaunchAction::RefreshCatalog => "↵ refresh",
+        LaunchAction::InstallUpdate => "↵ install",
         LaunchAction::Quit => "↵ quit",
     };
     let pin = if item.pinnable { "   ⌘P pin" } else { "" };
@@ -3195,6 +3201,7 @@ fn result_row(
         LaunchAction::SystemCommand { command } if command.requires_confirmation() => "REVIEW",
         LaunchAction::SystemCommand { .. } => "RUN",
         LaunchAction::RefreshCatalog => "REFRESH",
+        LaunchAction::InstallUpdate => "INSTALL",
         LaunchAction::Quit => "QUIT",
     };
     let item_id = result.item.id.clone();
@@ -3285,6 +3292,10 @@ impl Launcher {
                 })
                 .collect(),
             None => {
+                let update_result = (!self.update_installing && self.query.trim().is_empty())
+                    .then_some(self.available_update.as_ref())
+                    .flatten()
+                    .map(available_update_search_result);
                 let mut merged = self
                     .catalog
                     .search(
@@ -3331,9 +3342,13 @@ impl Launcher {
                         .then_with(|| left.source_index.cmp(&right.source_index))
                 });
 
-                let reserved = usize::from(self.calculator_result.is_some())
+                let reserved = usize::from(update_result.is_some())
+                    + usize::from(self.calculator_result.is_some())
                     + usize::from(self.web_search_result.is_some());
                 let mut results = Vec::with_capacity(RESULT_LIMIT);
+                if let Some(result) = update_result {
+                    results.push(result);
+                }
                 if let Some(item) = self.calculator_result.clone() {
                     results.push(dynamic_search_result(item));
                 }
@@ -3385,6 +3400,18 @@ fn dynamic_search_result(item: CatalogItem) -> SearchResult {
         pinned: false,
         frecency_score: 0,
     }
+}
+
+fn available_update_search_result(update: &updater::AvailableUpdate) -> SearchResult {
+    dynamic_search_result(CatalogItem {
+        id: INSTALL_UPDATE_ITEM_ID.to_owned(),
+        title: format!("Update DuckGooKey to {}", update.version),
+        subtitle: Some("A newer version is ready to install".to_owned()),
+        icon_path: None,
+        keywords: vec!["upgrade".to_owned(), "new version".to_owned()],
+        pinnable: false,
+        action: LaunchAction::InstallUpdate,
+    })
 }
 
 fn file_search_result(file: &FileResult) -> SearchResult {
@@ -4104,6 +4131,54 @@ mod tests {
             Some(LaunchAction::OpenUrl { .. })
         ));
         assert!(results.iter().all(|result| !result.item.pinnable));
+    }
+
+    #[test]
+    fn empty_root_results_put_an_available_update_first() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Example.app",
+            "Example",
+        ));
+        launcher.available_update = Some(updater::AvailableUpdate::for_test("0.2.3"));
+
+        let results = launcher.results();
+
+        assert_eq!(results[0].item.id, INSTALL_UPDATE_ITEM_ID);
+        assert_eq!(results[0].item.title, "Update DuckGooKey to 0.2.3");
+        assert!(matches!(
+            results[0].item.action,
+            LaunchAction::InstallUpdate
+        ));
+        assert!(!results[0].item.pinnable);
+    }
+
+    #[test]
+    fn available_update_is_hidden_once_a_root_query_is_entered() {
+        let mut launcher = launcher_with_item(CatalogItem::application(
+            "/Applications/Example.app",
+            "Example",
+        ));
+        launcher.available_update = Some(updater::AvailableUpdate::for_test("0.2.3"));
+
+        let _ = update(&mut launcher, Message::QueryChanged("example".to_owned()));
+        let results = launcher.results();
+
+        assert_eq!(results[0].item.title, "Example");
+        assert!(
+            results
+                .iter()
+                .all(|result| result.item.id != INSTALL_UPDATE_ITEM_ID)
+        );
+    }
+
+    #[test]
+    fn activating_available_update_result_starts_the_existing_install_flow() {
+        let mut launcher = launcher_with_item(CatalogItem::refresh_catalog());
+        launcher.available_update = Some(updater::AvailableUpdate::for_test("0.2.3"));
+
+        let _install = activate_item(&mut launcher, INSTALL_UPDATE_ITEM_ID);
+
+        assert!(launcher.update_installing);
     }
 
     #[test]

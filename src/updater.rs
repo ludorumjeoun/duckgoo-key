@@ -30,6 +30,19 @@ pub struct AvailableUpdate {
     archive_sha256: String,
 }
 
+#[cfg(test)]
+impl AvailableUpdate {
+    pub(crate) fn for_test(version: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            platform: "macos-aarch64",
+            archive_url: Url::parse("https://updates.key.duckgoo.net/test.app.zip")
+                .expect("the test update URL must be valid"),
+            archive_sha256: "0".repeat(64),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckResult {
     UpToDate,
